@@ -1,0 +1,15 @@
+{
+  "name": "relaypay-support",
+  "private": true,
+  "workspaces": ["mcp-server", "webhook", "web", "scripts"],
+  "scripts": {
+    "dev:mcp": "npm run dev -w mcp-server",
+    "dev:webhook": "npm run dev -w webhook",
+    "dev:web": "npm run dev -w web",
+    "seed": "npm run seed -w scripts",
+    "kb:ingest": "npm run kb:ingest -w scripts",
+    "kb:test": "npm run kb:test -w scripts",
+    "create-admin": "npm run create-admin -w scripts",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  }
+}
