@@ -109,6 +109,37 @@
   word-break: break-word;
 }
 
+.typed {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  background: var(--surface);
+  margin-left: 24px;
+}
+
+.typedBody {
+  font-size: 15px;
+  color: var(--text);
+  margin: 2px 0 4px;
+  word-break: break-word;
+}
+
+.chatBody {
+  flex: 1;
+}
+
+.composer {
+  display: flex;
+  gap: 8px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.composer :global(.input) {
+  flex: 1;
+  min-width: 0;
+}
+
 .form {
   padding: 20px;
   display: flex;

@@ -50,30 +50,76 @@ function toTranscript(messages: OpenAIMessage[]): TranscriptMessage[] {
     .filter((m) => m.content.length > 0);
 }
 
-/** Writes a reply in OpenAI chat-completions format (streamed or not). */
-function sendCompletion(res: Response, stream: boolean, text: string, model: string) {
-  const id = `chatcmpl-${crypto.randomUUID()}`;
-  const created = Math.floor(Date.now() / 1000);
-  if (!stream) {
-    res.json({
-      id,
-      object: "chat.completion",
-      created,
-      model,
-      choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-    });
-    return;
+/** Writes a reply in OpenAI chat-completions format, streaming deltas so Vapi can speak them as they arrive. */
+class CompletionWriter {
+  private readonly id = `chatcmpl-${crypto.randomUUID()}`;
+  private readonly created = Math.floor(Date.now() / 1000);
+  private buffered = "";
+  spoken = "";
+  lastWriteAt = Date.now();
+
+  constructor(
+    private readonly res: Response,
+    private readonly stream: boolean,
+    private readonly model: string,
+  ) {}
+
+  get open(): boolean {
+    return !this.res.writableEnded && !this.res.destroyed;
   }
-  const chunk = (delta: object, finish: string | null) =>
-    `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
-  if (!res.headersSent) {
-    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+
+  private chunk(delta: object, finish: string | null): string {
+    const payload = { id: this.id, object: "chat.completion.chunk", created: this.created, model: this.model, choices: [{ index: 0, delta, finish_reason: finish }] };
+    return `data: ${JSON.stringify(payload)}\n\n`;
   }
-  res.write(chunk({ content: text }, null));
-  res.write(chunk({}, "stop"));
-  res.write("data: [DONE]\n\n");
-  res.end();
+
+  write(text: string) {
+    if (!text || !this.open) return;
+    this.spoken += text;
+    this.lastWriteAt = Date.now();
+    if (this.stream) this.res.write(this.chunk({ content: text }, null));
+    else this.buffered += text;
+  }
+
+  /** Speaks a standalone sentence, separated from whatever was said before it. */
+  say(sentence: string) {
+    this.write(this.spoken && !/\s$/.test(this.spoken) ? ` ${sentence} ` : `${sentence} `);
+  }
+
+  end() {
+    if (!this.open) return;
+    if (!this.stream) {
+      this.res.json({
+        id: this.id,
+        object: "chat.completion",
+        created: this.created,
+        model: this.model,
+        choices: [{ index: 0, message: { role: "assistant", content: this.buffered }, finish_reason: "stop" }],
+      });
+      return;
+    }
+    this.res.write(this.chunk({}, "stop"));
+    this.res.write("data: [DONE]\n\n");
+    this.res.end();
+  }
 }
+
+function sendCompletion(res: Response, stream: boolean, text: string, model: string) {
+  const writer = new CompletionWriter(res, stream, model);
+  writer.write(text);
+  writer.end();
+}
+
+const HOLDING_LINES = [
+  "Give me a quick moment while I check that.",
+  "One moment please, let me look that up.",
+  "Just a second while I get that for you.",
+];
+const STILL_THERE_LINES = [
+  "Thanks for holding, I'm still getting that information for you.",
+  "I'm still on it, thank you for your patience.",
+];
+const STILL_THERE_AFTER_MS = 12_000;
 
 // ---------------------------------------------------------------------------
 // Custom LLM endpoint: Vapi POSTs the whole conversation on every turn.
@@ -128,19 +174,39 @@ vapiRouter.post("/chat/completions", async (req, res) => {
     turnNumber >= config.maxTurns ? "turn_limit" : elapsedSeconds >= config.wrapUpAfterSeconds ? "time_limit" : null;
 
   const abort = new AbortController();
+  const writer = new CompletionWriter(res, stream, config.agentModel);
+  let toolRunning = false;
+  let stillThereCount = 0;
+  // While a lookup runs, fill long silences so the caller knows Jane is still there.
+  const silenceTimer = setInterval(() => {
+    if (toolRunning && stillThereCount < STILL_THERE_LINES.length && Date.now() - writer.lastWriteAt >= STILL_THERE_AFTER_MS) {
+      writer.say(STILL_THERE_LINES[stillThereCount++]);
+    }
+  }, 1_000);
   res.on("close", () => {
+    clearInterval(silenceTimer);
     if (!res.writableEnded) abort.abort(); // caller interrupted / Vapi cancelled the turn
   });
 
   try {
     const prompt = buildTurnPrompt({ transcript, turnNumber, elapsedSeconds, wrapUp });
-    const result = await runJaneTurn(prompt, { vapiCallId, conversationId, turnId: userTurnId, turnNumber }, abort);
+    const result = await runJaneTurn(prompt, { vapiCallId, conversationId, turnId: userTurnId, turnNumber }, abort, {
+      onText: (delta) => {
+        toolRunning = false;
+        writer.write(delta);
+      },
+      onToolStart: () => {
+        if (!writer.spoken.trim()) writer.say(HOLDING_LINES[turnNumber % HOLDING_LINES.length]);
+        toolRunning = true;
+      },
+    });
+    clearInterval(silenceTimer);
 
     logTurn({
       conversation_id: conversationId,
       turn_number: turnNumber,
       role: "assistant",
-      content: result.text,
+      content: writer.spoken.trim() || result.text,
       answer_type: wrapUp ? "wrap_up" : classifyAnswer(result),
       status: result.hadToolError ? "error" : "success",
       error_message: result.hadToolError ? "An MCP tool returned an error during this turn" : null,
@@ -166,8 +232,9 @@ vapiRouter.post("/chat/completions", async (req, res) => {
       );
     }
 
-    if (!res.writableEnded) sendCompletion(res, stream, result.text, result.model);
+    writer.end();
   } catch (err) {
+    clearInterval(silenceTimer);
     if (abort.signal.aborted && res.destroyed) {
       // Vapi dropped the request (the caller spoke over Jane); the next request carries the new turn.
       console.log(`[vapi] turn ${turnNumber} of ${conversationId} cancelled by caller interruption`);
@@ -199,7 +266,8 @@ vapiRouter.post("/chat/completions", async (req, res) => {
       ],
       "Jane could not respond and told the customer the support team will follow up. Please review the conversation in the admin dashboard.",
     );
-    if (!res.writableEnded && !res.destroyed) sendCompletion(res, stream, FALLBACK_LINE, config.agentModel);
+    writer.say(FALLBACK_LINE);
+    writer.end();
   }
 });
 

@@ -18,6 +18,10 @@ interface JaneMessage {
   sentAt: string;
 }
 
+type ChatItem = ({ from: "jane" } & JaneMessage) | { from: "you"; id: string; body: string; sentAt: string };
+
+const TYPED_PREFIX = "[Typed in chat] ";
+
 function describeFailure(err: unknown): string {
   if (err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "SecurityError")) {
     return "microphone permission denied";
@@ -31,8 +35,9 @@ function describeFailure(err: unknown): string {
 export function SupportPanel() {
   const [state, setState] = useState<CallState>("idle");
   const [speaking, setSpeaking] = useState(false);
-  const [messages, setMessages] = useState<JaneMessage[]>([]);
+  const [messages, setMessages] = useState<ChatItem[]>([]);
   const [failureReason, setFailureReason] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
 
   const vapiRef = useRef<Vapi | null>(null);
   const stateRef = useRef<CallState>("idle");
@@ -70,7 +75,7 @@ export function SupportPanel() {
     const es = new EventSource(`${WEBHOOK_URL}/api/chat-stream/${encodeURIComponent(callId)}`);
     es.addEventListener("jane-message", (event) => {
       const push = JSON.parse((event as MessageEvent).data) as JaneMessage;
-      setMessages((prev) => (prev.some((m) => m.id === push.id) ? prev : [...prev, push]));
+      setMessages((prev) => (prev.some((m) => m.id === push.id) ? prev : [...prev, { from: "jane", ...push }]));
     });
     streamRef.current = es;
   };
@@ -139,6 +144,15 @@ export function SupportPanel() {
     vapiRef.current?.stop().catch(() => undefined);
   };
 
+  const sendTyped = (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = draft.trim();
+    if (!text || stateRef.current !== "active" || !vapiRef.current) return;
+    vapiRef.current.send({ type: "add-message", message: { role: "user", content: TYPED_PREFIX + text } });
+    setMessages((prev) => [...prev, { from: "you", id: crypto.randomUUID(), body: text, sentAt: new Date().toISOString() }]);
+    setDraft("");
+  };
+
   const inCall = state === "connecting" || state === "active";
 
   return (
@@ -193,29 +207,58 @@ export function SupportPanel() {
           <>
             <div className={styles.chatHeader}>
               <h2 id="chat-heading" className={styles.chatTitle}>
-                Messages from Jane
+                Chat
               </h2>
-              <span className="muted small">Read-only</span>
+              <span className="muted small">{state === "active" ? "Type during the call" : "Available during a call"}</span>
             </div>
             <div className={styles.chatBody} aria-live="polite">
               {messages.length === 0 ? (
                 <p className="muted small">
                   {inCall
-                    ? "When Jane needs to share a reference number or account detail, it will appear here instead of being read aloud."
-                    : "Start a call with Jane. Reference numbers and account details she shares will appear here."}
+                    ? "Type your email or other details here if they're hard to say. Reference numbers Jane shares will appear here instead of being read aloud."
+                    : "Start a call with Jane. You can type details here during the call, and reference numbers she shares will appear here."}
                 </p>
               ) : (
-                messages.map((m) => (
-                  <article key={m.id} className={styles.push}>
-                    <div className={styles.pushTitle}>{m.title}</div>
-                    <div className={styles.pushBody}>{m.body}</div>
+                messages.map((m) => {
+                  const time = (
                     <time className="muted small" dateTime={m.sentAt}>
                       {new Date(m.sentAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                     </time>
-                  </article>
-                ))
+                  );
+                  return m.from === "jane" ? (
+                    <article key={m.id} className={styles.push}>
+                      <div className={styles.pushTitle}>{m.title}</div>
+                      <div className={styles.pushBody}>{m.body}</div>
+                      {time}
+                    </article>
+                  ) : (
+                    <article key={m.id} className={styles.typed}>
+                      <div className={styles.pushTitle}>You typed</div>
+                      <div className={styles.typedBody}>{m.body}</div>
+                      {time}
+                    </article>
+                  );
+                })
               )}
             </div>
+            <form className={styles.composer} onSubmit={sendTyped}>
+              <label htmlFor="chat-input" className="sr-only">
+                Type a message to Jane
+              </label>
+              <input
+                id="chat-input"
+                className="input"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                placeholder={state === "active" ? "Type your email or a detail…" : "Start a call to type"}
+                disabled={state !== "active"}
+                maxLength={500}
+                autoComplete="off"
+              />
+              <button className="btn btn-primary" type="submit" disabled={state !== "active" || !draft.trim()}>
+                Send
+              </button>
+            </form>
           </>
         )}
       </section>

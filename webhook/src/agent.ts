@@ -39,6 +39,11 @@ export interface AgentTurnResult {
 
 export class AgentFailure extends Error {}
 
+export interface TurnStreamHandlers {
+  onText: (delta: string) => void;
+  onToolStart: () => void;
+}
+
 /** In-process tool for the one-way text push to the caller's chat widget. */
 function chatServer(turn: TurnIdentity) {
   return createSdkMcpServer({
@@ -84,11 +89,17 @@ function toolResultText(content: unknown): string {
  * Runs one Jane turn through the Claude Agent SDK. Stateless: the full
  * transcript is in `prompt`; nothing persists between calls.
  */
-export async function runJaneTurn(prompt: string, turn: TurnIdentity, abort: AbortController): Promise<AgentTurnResult> {
+export async function runJaneTurn(
+  prompt: string,
+  turn: TurnIdentity,
+  abort: AbortController,
+  handlers: TurnStreamHandlers,
+): Promise<AgentTurnResult> {
   const toolsUsed: string[] = [];
   let hadToolError = false;
   let hadConfidentRetrieval: boolean | null = null;
   const pendingToolNames = new Map<string, string>();
+  let streamed = "";
 
   const stream = query({
     prompt,
@@ -103,6 +114,7 @@ export async function runJaneTurn(prompt: string, turn: TurnIdentity, abort: Abo
       settingSources: [],
       strictMcpConfig: true,
       persistSession: false,
+      includePartialMessages: true,
       maxTurns: 10,
       mcpServers: {
         relaypay: {
@@ -124,7 +136,19 @@ export async function runJaneTurn(prompt: string, turn: TurnIdentity, abort: Abo
   });
 
   for await (const message of stream) {
-    if (message.type === "system" && message.subtype === "init") {
+    if (message.type === "stream_event") {
+      const ev = message.event;
+      if (ev.type === "content_block_start" && ev.content_block.type === "tool_use") {
+        handlers.onToolStart();
+      } else if (ev.type === "content_block_start" && ev.content_block.type === "text" && streamed && !/\s$/.test(streamed)) {
+        // Text after a tool call is a new block; keep it from running into the previous sentence.
+        streamed += " ";
+        handlers.onText(" ");
+      } else if (ev.type === "content_block_delta" && ev.delta.type === "text_delta" && ev.delta.text) {
+        streamed += ev.delta.text;
+        handlers.onText(ev.delta.text);
+      }
+    } else if (message.type === "system" && message.subtype === "init") {
       const relaypay = message.mcp_servers.find((s) => s.name === "relaypay");
       if (!relaypay || relaypay.status === "failed") {
         abort.abort();
@@ -161,8 +185,9 @@ export async function runJaneTurn(prompt: string, turn: TurnIdentity, abort: Abo
         cacheWriteTokens: models.reduce((n, m) => n + m.cacheCreationInputTokens, 0),
         costUsd: message.total_cost_usd,
       };
-      const text = message.result.trim();
+      const text = streamed.trim() || message.result.trim();
       if (!text) throw new AgentFailure("Agent returned an empty reply");
+      if (!streamed.trim()) handlers.onText(text);
       return { text, toolsUsed, hadToolError, hadConfidentRetrieval, usage, model: config.agentModel };
     }
   }
