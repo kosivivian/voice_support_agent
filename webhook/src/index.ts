@@ -22,7 +22,7 @@ if (config.isProduction) {
 app.use(express.json({ limit: "2mb" }));
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "relaypay-webhook", model: config.agentModel });
+  res.json({ ok: true, service: "relaypay-webhook", model: config.agentModel, commit: process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 7) ?? "local", streaming: true });
 });
 
 app.use("/vapi", vapiRouter);
