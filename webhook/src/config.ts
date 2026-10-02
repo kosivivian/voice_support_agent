@@ -12,6 +12,13 @@ export const config = {
   agentModel: process.env.AGENT_MODEL ?? "claude-sonnet-4-6",
   agentEffort: (process.env.AGENT_EFFORT ?? "low") as "low" | "medium" | "high",
   summaryModel: process.env.SUMMARY_MODEL ?? "claude-haiku-4-5",
+  // Extended thinking adds seconds before every spoken reply; off unless AGENT_THINKING=on.
+  agentThinking: process.env.AGENT_THINKING === "on",
+  // Pre-started agent processes kept ready (each holds roughly 250 MB while idle).
+  agentWarmPool: Math.max(1, Number(process.env.AGENT_WARM_POOL ?? 2)),
+  agentSpareMaxAgeMs: Number(process.env.AGENT_SPARE_MAX_AGE_SECONDS ?? 600) * 1000,
+  // If Jane has said nothing this long into a turn, speak a short acknowledgement.
+  instantAckAfterMs: Number(process.env.INSTANT_ACK_AFTER_MS ?? 2500),
 
   mcpServerUrl: required("MCP_SERVER_URL").replace(/\/+$/, ""),
   mcpApiKey: required("MCP_API_KEY"),

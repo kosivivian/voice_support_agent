@@ -6,6 +6,8 @@ import { notifySupport } from "./email.js";
 import { earlierLookups } from "./callMemory.js";
 import { conversationIdForCall } from "./ids.js";
 import { finalizeConversation, logTurn, markConversationError, recordTurnCount, startConversation } from "./logging.js";
+import { logAuditEvents } from "./auditEvents.js";
+import { TurnTimer } from "./latency.js";
 import { buildTurnPrompt, type TranscriptMessage } from "./prompt.js";
 import { summarizeConversation } from "./summary.js";
 
@@ -121,6 +123,15 @@ const STILL_THERE_LINES = [
   "I'm still on it, thank you for your patience.",
 ];
 const STILL_THERE_AFTER_MS = 12_000;
+const INSTANT_ACKS = ["Mm-hmm, one moment.", "Okay, one second.", "Sure, just a moment."];
+
+// Calls whose conversation row already exists, so later turns skip that database round trip.
+const startedCalls = new Set<string>();
+async function ensureConversation(conversationId: string, vapiCallId: string, callStart: string | null) {
+  if (startedCalls.has(conversationId)) return;
+  await startConversation(conversationId, vapiCallId, callStart);
+  startedCalls.add(conversationId);
+}
 
 // ---------------------------------------------------------------------------
 // Custom LLM endpoint: Vapi POSTs the whole conversation on every turn.
@@ -128,6 +139,7 @@ const STILL_THERE_AFTER_MS = 12_000;
 // ---------------------------------------------------------------------------
 vapiRouter.post("/chat/completions", async (req, res) => {
   const started = Date.now();
+  const timer = new TurnTimer();
   const body = req.body ?? {};
   const stream = body.stream !== false;
   const transcript = toTranscript(Array.isArray(body.messages) ? body.messages : []);
@@ -147,7 +159,10 @@ vapiRouter.post("/chat/completions", async (req, res) => {
     res.flushHeaders();
   }
 
-  await startConversation(conversationId, vapiCallId, callStart);
+  // The conversation row is created alongside the agent rather than before it.
+  // Every write that references the row waits for it; the model does not.
+  const conversationReady = ensureConversation(conversationId, vapiCallId, callStart).then(() => timer.mark("conversation_ready"));
+  const afterReady = (write: () => void) => void conversationReady.then(write);
 
   if (!latestUser) {
     // Nothing from the caller yet (e.g. Vapi asking for an opening line).
@@ -157,16 +172,20 @@ vapiRouter.post("/chat/completions", async (req, res) => {
 
   // The greeting is spoken by Vapi as firstMessage; record it once as turn 0.
   if (turnNumber === 1 && transcript[0]?.role === "assistant") {
-    logTurn({ conversation_id: conversationId, turn_number: 0, role: "assistant", content: transcript[0].content, answer_type: "greeting" });
+    const greeting = transcript[0].content;
+    afterReady(() => logTurn({ conversation_id: conversationId, turn_number: 0, role: "assistant", content: greeting, answer_type: "greeting" }));
   }
 
   const userTurnId = crypto.randomUUID();
-  logTurn({ turn_id: userTurnId, conversation_id: conversationId, turn_number: turnNumber, role: "user", content: latestUser.content });
-  recordTurnCount(conversationId, turnNumber);
+  const userText = latestUser.content;
+  afterReady(() => {
+    logTurn({ turn_id: userTurnId, conversation_id: conversationId, turn_number: turnNumber, role: "user", content: userText });
+    recordTurnCount(conversationId, turnNumber);
+  });
 
   // Past the limit (the call should already have ended): close again without calling the agent.
   if (turnNumber > config.maxTurns || elapsedSeconds >= config.maxCallSeconds) {
-    logTurn({ conversation_id: conversationId, turn_number: turnNumber, role: "assistant", content: CLOSING_LINE, answer_type: "wrap_up" });
+    afterReady(() => logTurn({ conversation_id: conversationId, turn_number: turnNumber, role: "assistant", content: CLOSING_LINE, answer_type: "wrap_up" }));
     sendCompletion(res, stream, CLOSING_LINE, config.agentModel);
     return;
   }
@@ -178,12 +197,17 @@ vapiRouter.post("/chat/completions", async (req, res) => {
   const writer = new CompletionWriter(res, stream, config.agentModel);
   let toolRunning = false;
   let stillThereCount = 0;
-  // While a lookup runs, fill long silences so the caller knows Jane is still there.
+  // Fill silences so the caller knows Jane is there: a quick acknowledgement if
+  // nothing has been said yet, and a "still working" line during long lookups.
   const silenceTimer = setInterval(() => {
-    if (toolRunning && stillThereCount < STILL_THERE_LINES.length && Date.now() - writer.lastWriteAt >= STILL_THERE_AFTER_MS) {
+    if (!writer.spoken.trim() && Date.now() - started >= config.instantAckAfterMs) {
+      writer.say(INSTANT_ACKS[turnNumber % INSTANT_ACKS.length]);
+      timer.mark("first_spoken");
+      timer.mark("instant_ack");
+    } else if (toolRunning && stillThereCount < STILL_THERE_LINES.length && Date.now() - writer.lastWriteAt >= STILL_THERE_AFTER_MS) {
       writer.say(STILL_THERE_LINES[stillThereCount++]);
     }
-  }, 1_000);
+  }, 250);
   res.on("close", () => {
     clearInterval(silenceTimer);
     if (!res.writableEnded) abort.abort(); // caller interrupted / Vapi cancelled the turn
@@ -191,23 +215,33 @@ vapiRouter.post("/chat/completions", async (req, res) => {
 
   try {
     const prompt = buildTurnPrompt({ transcript, turnNumber, elapsedSeconds, wrapUp, earlierLookups: earlierLookups(vapiCallId) });
-    const result = await runJaneTurn(prompt, { vapiCallId, conversationId, turnId: userTurnId, turnNumber }, abort, {
+    const turnIdentity = { vapiCallId, conversationId, turnId: userTurnId, turnNumber, ready: conversationReady };
+    const result = await runJaneTurn(prompt, turnIdentity, abort.signal, {
       onText: (delta) => {
         toolRunning = false;
         writer.write(delta);
+        if (delta.trim()) timer.mark("first_spoken");
       },
       onToolStart: () => {
-        if (!writer.spoken.trim()) writer.say(HOLDING_LINES[turnNumber % HOLDING_LINES.length]);
+        if (!writer.spoken.trim()) {
+          writer.say(HOLDING_LINES[turnNumber % HOLDING_LINES.length]);
+          timer.mark("first_spoken");
+          timer.mark("holding_line");
+        }
         toolRunning = true;
       },
-    });
+    }, timer);
     clearInterval(silenceTimer);
+    writer.end();
+    const timings = timer.summary();
+    console.log(`[latency] ${conversationId} turn ${turnNumber} ${JSON.stringify(timings)}`);
 
-    logTurn({
+    const assistantText = writer.spoken.trim() || result.text;
+    afterReady(() => logTurn({
       conversation_id: conversationId,
       turn_number: turnNumber,
       role: "assistant",
-      content: writer.spoken.trim() || result.text,
+      content: assistantText,
       answer_type: wrapUp ? "wrap_up" : classifyAnswer(result),
       status: result.hadToolError ? "error" : "success",
       error_message: result.hadToolError ? "An MCP tool returned an error during this turn" : null,
@@ -218,10 +252,12 @@ vapiRouter.post("/chat/completions", async (req, res) => {
       cost_usd: result.usage.costUsd,
       latency_ms: Date.now() - started,
       model_used: result.model,
-    });
+      timings,
+    }));
+    afterReady(() => logAuditEvents(turnIdentity, result.toolResults, wrapUp));
 
     if (result.hadToolError) {
-      markConversationError(conversationId, "MCP tool error during call");
+      afterReady(() => markConversationError(conversationId, "MCP tool error during call"));
       void notifySupport(
         "Jane: technical issue during a call",
         [
@@ -232,8 +268,6 @@ vapiRouter.post("/chat/completions", async (req, res) => {
         "A support tool failed during a live call. The customer was told the team will follow up.",
       );
     }
-
-    writer.end();
   } catch (err) {
     clearInterval(silenceTimer);
     if (abort.signal.aborted && res.destroyed) {
@@ -244,7 +278,7 @@ vapiRouter.post("/chat/completions", async (req, res) => {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[vapi] agent failure (conversation ${conversationId}):`, message);
 
-    logTurn({
+    afterReady(() => logTurn({
       conversation_id: conversationId,
       turn_number: turnNumber,
       role: "assistant",
@@ -254,8 +288,8 @@ vapiRouter.post("/chat/completions", async (req, res) => {
       error_message: err instanceof AgentFailure ? message : `Unexpected: ${message}`,
       latency_ms: Date.now() - started,
       model_used: config.agentModel,
-    });
-    markConversationError(conversationId, message);
+    }));
+    afterReady(() => markConversationError(conversationId, message));
     void notifySupport(
       "Jane: backend failure during a call",
       [
@@ -290,9 +324,10 @@ vapiRouter.post("/events", async (req, res) => {
 
   try {
     if (message.type === "status-update" && message.status === "in-progress") {
-      await startConversation(conversationId, callId, message.call?.startedAt ?? message.call?.createdAt ?? null);
+      await ensureConversation(conversationId, callId, message.call?.startedAt ?? message.call?.createdAt ?? null);
     } else if (message.type === "end-of-call-report") {
-      await startConversation(conversationId, callId, message.startedAt ?? message.call?.startedAt ?? null);
+      await ensureConversation(conversationId, callId, message.startedAt ?? message.call?.startedAt ?? null);
+      startedCalls.delete(conversationId);
       const artifactMessages: VapiArtifactMessage[] = message.artifact?.messages ?? message.messages ?? [];
       const lines = artifactMessages
         .filter((m) => m.role === "user" || m.role === "bot" || m.role === "assistant")

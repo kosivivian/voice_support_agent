@@ -1,33 +1,24 @@
-import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
-import * as z from "zod";
-import { publish } from "./chatHub.js";
+import type { Query } from "@anthropic-ai/claude-agent-sdk";
+import { acquireSpare, type Spare, type TurnIdentity } from "./agentPool.js";
 import { rememberLookup } from "./callMemory.js";
 import { config } from "./config.js";
-import { logToolCall } from "./logging.js";
-import { JANE_SYSTEM_PROMPT } from "./prompt.js";
+import type { ToolTiming, TurnTimer } from "./latency.js";
 
-const RELAYPAY_TOOLS = [
-  "lookup_customer",
-  "lookup_transaction",
-  "lookup_payout",
-  "retrieve_knowledge",
-  "create_ticket",
-  "create_escalation",
-  "log_conversation_event",
-].map((name) => `mcp__relaypay__${name}`);
+export type { TurnIdentity } from "./agentPool.js";
 
 const REMEMBERED_TOOLS = new Set(["lookup_customer", "lookup_transaction", "lookup_payout"]);
 
-export interface TurnIdentity {
-  vapiCallId: string;
-  conversationId: string;
-  turnId: string;
-  turnNumber: number;
+export interface ToolOutcome {
+  name: string;
+  input: unknown;
+  output: string;
+  isError: boolean;
 }
 
 export interface AgentTurnResult {
   text: string;
   toolsUsed: string[];
+  toolResults: ToolOutcome[];
   hadToolError: boolean;
   hadConfidentRetrieval: boolean | null;
   usage: {
@@ -47,39 +38,6 @@ export interface TurnStreamHandlers {
   onToolStart: () => void;
 }
 
-/** In-process tool for the one-way text push to the caller's chat widget. */
-function chatServer(turn: TurnIdentity) {
-  return createSdkMcpServer({
-    name: "chat",
-    version: "1.0.0",
-    tools: [
-      tool(
-        "send_chat_message",
-        "Send information that must not be spoken aloud (transaction or payout reference numbers, account identifiers) to the caller's chat window as a short text card. One-way: the caller cannot reply through it. Say \"I'll send that to your chat window.\" in your spoken reply.",
-        {
-          title: z.string().describe('Short card title, e.g. "Transaction reference"'),
-          body: z.string().describe("The text to show, e.g. TXN-9001"),
-        },
-        async ({ title, body }) => {
-          const { delivered } = publish(turn.vapiCallId, title, body);
-          const output = { sent: true, live_delivered: delivered > 0 };
-          logToolCall({
-            conversation_id: turn.conversationId,
-            turn_id: turn.turnId,
-            turn_number: turn.turnNumber,
-            tool_name: "send_chat_message",
-            input: { title, body },
-            output,
-            status: "success",
-          });
-          return { content: [{ type: "text", text: JSON.stringify(output) }] };
-        },
-        { alwaysLoad: true },
-      ),
-    ],
-  });
-}
-
 function toolResultText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -89,117 +47,146 @@ function toolResultText(content: unknown): string {
 }
 
 /**
- * Runs one Jane turn through the Claude Agent SDK. Stateless: the full
- * transcript is in `prompt`; nothing persists between calls.
+ * Runs one Jane turn on a pre-started agent process. Stateless: the full
+ * transcript is in `prompt`. A dead pre-started process is retried once on a
+ * fresh one, as long as nothing has been streamed to the caller yet.
  */
 export async function runJaneTurn(
   prompt: string,
   turn: TurnIdentity,
-  abort: AbortController,
+  signal: AbortSignal,
   handlers: TurnStreamHandlers,
+  timer: TurnTimer,
+): Promise<AgentTurnResult> {
+  timer.mark("agent_start");
+  for (let attempt = 0; ; attempt++) {
+    const { spare, warm } = await acquireSpare();
+    timer.warm = warm;
+    timer.mark(attempt === 0 ? "spare_ready" : "retry_spare_ready");
+    const state = { output: false };
+    try {
+      return await runOnSpare(spare, prompt, turn, signal, handlers, timer, state);
+    } catch (err) {
+      if (signal.aborted || state.output || !warm || attempt > 0) throw err;
+      console.warn("[agent] pre-started process failed before replying; retrying on a fresh one:", err instanceof Error ? err.message : err);
+    }
+  }
+}
+
+async function runOnSpare(
+  spare: Spare,
+  prompt: string,
+  turn: TurnIdentity,
+  signal: AbortSignal,
+  handlers: TurnStreamHandlers,
+  timer: TurnTimer,
+  state: { output: boolean },
 ): Promise<AgentTurnResult> {
   const toolsUsed: string[] = [];
+  const toolResults: ToolOutcome[] = [];
   let hadToolError = false;
   let hadConfidentRetrieval: boolean | null = null;
   const pendingToolNames = new Map<string, string>();
   const pendingToolInputs = new Map<string, unknown>();
+  const toolTimings = new Map<string, ToolTiming>();
+  let passOutputTokens = 0;
   let streamed = "";
 
-  const stream = query({
-    prompt,
-    options: {
-      abortController: abort,
-      model: config.agentModel,
-      effort: config.agentEffort,
-      systemPrompt: JANE_SYSTEM_PROMPT,
-      tools: [],
-      allowedTools: [...RELAYPAY_TOOLS, "mcp__chat__send_chat_message"],
-      permissionMode: "dontAsk",
-      settingSources: [],
-      strictMcpConfig: true,
-      persistSession: false,
-      includePartialMessages: true,
-      maxTurns: 10,
-      mcpServers: {
-        relaypay: {
-          type: "http",
-          url: `${config.mcpServerUrl}/mcp`,
-          headers: {
-            "x-api-key": config.mcpApiKey,
-            "x-conversation-id": turn.conversationId,
-            "x-turn-id": turn.turnId,
-            "x-turn-number": String(turn.turnNumber),
-          },
-          alwaysLoad: true,
-          timeout: 20_000,
-        },
-        chat: chatServer(turn),
-      },
-      env: { ...process.env, ANTHROPIC_API_KEY: config.anthropicApiKey, CLAUDE_AGENT_SDK_CLIENT_APP: "relaypay-jane/1.0" },
-    },
-  });
+  spare.holder.turn = turn;
+  const onAbort = () => spare.abort.abort();
+  if (signal.aborted) onAbort();
+  signal.addEventListener("abort", onAbort, { once: true });
 
-  for await (const message of stream) {
-    if (message.type === "stream_event") {
-      const ev = message.event;
-      if (ev.type === "content_block_start" && ev.content_block.type === "tool_use") {
-        handlers.onToolStart();
-      } else if (ev.type === "content_block_start" && ev.content_block.type === "text" && streamed && !/\s$/.test(streamed)) {
-        // Text after a tool call is a new block; keep it from running into the previous sentence.
-        streamed += " ";
-        handlers.onText(" ");
-      } else if (ev.type === "content_block_delta" && ev.delta.type === "text_delta" && ev.delta.text) {
-        streamed += ev.delta.text;
-        handlers.onText(ev.delta.text);
-      }
-    } else if (message.type === "system" && message.subtype === "init") {
-      const relaypay = message.mcp_servers.find((s) => s.name === "relaypay");
-      if (!relaypay || relaypay.status === "failed") {
-        abort.abort();
-        throw new AgentFailure(`MCP server unavailable (status: ${relaypay?.status ?? "missing"})`);
-      }
-    } else if (message.type === "assistant") {
-      for (const block of message.message.content) {
-        if (block.type === "tool_use") {
-          const name = block.name.replace(/^mcp__(relaypay|chat)__/, "");
-          toolsUsed.push(name);
-          pendingToolNames.set(block.id, name);
-          pendingToolInputs.set(block.id, block.input);
+  let stream: Query | null = null;
+  try {
+    stream = spare.warm.query(prompt);
+    for await (const message of stream) {
+      if (message.type === "stream_event") {
+        const ev = message.event;
+        if (ev.type === "message_start") {
+          const u = ev.message.usage;
+          timer.passStart((u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0));
+          passOutputTokens = 0;
+        } else if (ev.type === "message_delta") {
+          passOutputTokens = ev.usage?.output_tokens ?? passOutputTokens;
+        } else if (ev.type === "message_stop") {
+          timer.passEnd(passOutputTokens);
+        } else if (ev.type === "content_block_stop") {
+          timer.blockStop();
+        } else if (ev.type === "content_block_start" && (ev.content_block.type === "thinking" || ev.content_block.type === "redacted_thinking")) {
+          timer.thinkingStart();
         }
-      }
-    } else if (message.type === "user" && Array.isArray(message.message.content)) {
-      for (const block of message.message.content) {
-        if (block.type !== "tool_result") continue;
-        const name = pendingToolNames.get(block.tool_use_id);
-        const text = toolResultText(block.content);
-        if (block.is_error || text.includes('"error":"technical_error"')) hadToolError = true;
-        if (name && REMEMBERED_TOOLS.has(name) && !block.is_error && text.includes('"found":true')) {
-          rememberLookup(turn.vapiCallId, name, pendingToolInputs.get(block.tool_use_id), text);
+        if (ev.type === "content_block_start" && ev.content_block.type === "tool_use") {
+          timer.output();
+          state.output = true;
+          toolTimings.set(ev.content_block.id, timer.toolEmitted(ev.content_block.name.replace(/^mcp__(relaypay|chat)__/, "")));
+          handlers.onToolStart();
+        } else if (ev.type === "content_block_start" && ev.content_block.type === "text" && streamed && !/\s$/.test(streamed)) {
+          // Text after a tool call is a new block; keep it from running into the previous sentence.
+          streamed += " ";
+          handlers.onText(" ");
+        } else if (ev.type === "content_block_delta" && ev.delta.type === "text_delta" && ev.delta.text) {
+          timer.output();
+          timer.mark("first_text");
+          state.output = true;
+          streamed += ev.delta.text;
+          handlers.onText(ev.delta.text);
         }
-        if (name === "retrieve_knowledge") {
-          const confident = text.includes('"has_confident_match":true');
-          hadConfidentRetrieval = (hadConfidentRetrieval ?? false) || confident;
+      } else if (message.type === "system" && message.subtype === "init") {
+        timer.mark("sdk_init");
+      } else if (message.type === "assistant") {
+        for (const block of message.message.content) {
+          if (block.type === "tool_use") {
+            const name = block.name.replace(/^mcp__(relaypay|chat)__/, "");
+            toolsUsed.push(name);
+            pendingToolNames.set(block.id, name);
+            pendingToolInputs.set(block.id, block.input);
+            const tt = toolTimings.get(block.id);
+            if (tt) tt.started = timer.now();
+          }
         }
+      } else if (message.type === "user" && Array.isArray(message.message.content)) {
+        for (const block of message.message.content) {
+          if (block.type !== "tool_result") continue;
+          const name = pendingToolNames.get(block.tool_use_id);
+          const text = toolResultText(block.content);
+          const tt = toolTimings.get(block.tool_use_id);
+          if (tt) tt.finished = timer.now();
+          const isError = Boolean(block.is_error) || text.includes('"error":"technical_error"');
+          if (isError) hadToolError = true;
+          if (name) toolResults.push({ name, input: pendingToolInputs.get(block.tool_use_id), output: text, isError });
+          if (name && REMEMBERED_TOOLS.has(name) && !isError && text.includes('"found":true')) {
+            rememberLookup(turn.vapiCallId, name, pendingToolInputs.get(block.tool_use_id), text);
+          }
+          if (name === "retrieve_knowledge") {
+            const confident = text.includes('"has_confident_match":true');
+            hadConfidentRetrieval = (hadConfidentRetrieval ?? false) || confident;
+          }
+        }
+      } else if (message.type === "result") {
+        if (message.subtype !== "success" || message.is_error) {
+          throw new AgentFailure(`Agent run ended with ${message.subtype}`);
+        }
+        const models = Object.values(message.modelUsage);
+        const usage = {
+          inputTokens: models.reduce((n, m) => n + m.inputTokens, 0),
+          outputTokens: models.reduce((n, m) => n + m.outputTokens, 0),
+          cacheReadTokens: models.reduce((n, m) => n + m.cacheReadInputTokens, 0),
+          cacheWriteTokens: models.reduce((n, m) => n + m.cacheCreationInputTokens, 0),
+          costUsd: message.total_cost_usd,
+        };
+        const text = streamed.trim() || message.result.trim();
+        if (!text) throw new AgentFailure("Agent returned an empty reply");
+        if (!streamed.trim()) handlers.onText(text);
+        return { text, toolsUsed, toolResults, hadToolError, hadConfidentRetrieval, usage, model: config.agentModel };
       }
-    } else if (message.type === "result") {
-      if (message.subtype !== "success" || message.is_error) {
-        throw new AgentFailure(`Agent run ended with ${message.subtype}`);
-      }
-      const models = Object.values(message.modelUsage);
-      const usage = {
-        inputTokens: models.reduce((n, m) => n + m.inputTokens, 0),
-        outputTokens: models.reduce((n, m) => n + m.outputTokens, 0),
-        cacheReadTokens: models.reduce((n, m) => n + m.cacheReadInputTokens, 0),
-        cacheWriteTokens: models.reduce((n, m) => n + m.cacheCreationInputTokens, 0),
-        costUsd: message.total_cost_usd,
-      };
-      const text = streamed.trim() || message.result.trim();
-      if (!text) throw new AgentFailure("Agent returned an empty reply");
-      if (!streamed.trim()) handlers.onText(text);
-      return { text, toolsUsed, hadToolError, hadConfidentRetrieval, usage, model: config.agentModel };
     }
+    throw new AgentFailure("Agent stream ended without a result");
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    spare.holder.turn = null;
+    stream?.close();
   }
-  throw new AgentFailure("Agent stream ended without a result");
 }
 
 /** Best-effort label for the admin dashboard. */

@@ -25,10 +25,20 @@ export interface TurnRecord {
   cost_usd?: number | null;
   latency_ms?: number | null;
   model_used?: string | null;
+  timings?: unknown;
 }
 
 export function logTurn(turn: TurnRecord) {
-  anonDb.from("turns").insert(turn).then(report("turns insert"));
+  anonDb
+    .from("turns")
+    .insert(turn)
+    .then(({ error }) => {
+      // Until migration 003 adds the column, save the turn without its timings.
+      if (error && turn.timings !== undefined && /timings/.test(error.message)) {
+        const { timings: _dropped, ...rest } = turn;
+        anonDb.from("turns").insert(rest).then(report("turns insert"));
+      } else report("turns insert")({ error });
+    });
 }
 
 export function logToolCall(row: {

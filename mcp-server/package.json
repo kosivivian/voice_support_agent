@@ -16,6 +16,7 @@
     "@supabase/supabase-js": "^2.117.2",
     "express": "^5.2.1",
     "resend": "^6.30.0",
+    "undici": "^7.30.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {

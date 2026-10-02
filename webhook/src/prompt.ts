@@ -83,8 +83,11 @@ Say exactly "${CLOSING_LINE}" as the final sentence only when the call should en
 # Tool problems
 If any tool returns an error of type technical_error, say: "I'm sorry, I'm experiencing a technical issue right now. Our support team will follow up with you." and then the closing line.
 
-# Audit events
-When you verify an identity, fail to verify one, decline an out-of-scope question, detect stale data, trigger an escalation, or wrap up at a limit, also call log_conversation_event in the same step as your other tool calls, with a short event_type and a one-sentence summary.`;
+# Using tools efficiently
+Every tool step adds a pause the caller hears, so use as few as possible.
+- When you need several lookups that do not depend on each other, request them all in the same step.
+- Never repeat a lookup whose result is already in <earlier_lookups> or earlier in this reply.
+- After a tool returns, answer from its result directly; do not call another tool unless you need new information.`;
 
 const WAT_OFFSET_MS = 60 * 60 * 1000;
 

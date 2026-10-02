@@ -126,6 +126,7 @@ export function buildServer(ctx: CallContext): McpServer {
     "lookup_customer",
     {
       title: "Look up customer",
+      annotations: { readOnlyHint: true },
       description:
         "Find a RelayPay customer by their email address (the only identity signal). Call this before any account, transaction or payout lookup. company_name is optional supporting context and can never trigger a lookup on its own. account_status, kyc_status and support_notes are AGENT CONTEXT ONLY and must never be spoken; only the email and plan may be read back for confirmation.",
       inputSchema: z.object({
@@ -167,7 +168,6 @@ export function buildServer(ctx: CallContext): McpServer {
         account_status: data.account_status,
         kyc_status: data.kyc_status,
         support_notes: data.support_notes,
-        speakable_fields: ["email", "plan"],
         next_step: `Confirm back: "I've found your account under ${data.contact_email} on the ${data.plan} plan — is that correct?" Proceed only after the caller confirms.`,
       };
     }),
@@ -178,6 +178,7 @@ export function buildServer(ctx: CallContext): McpServer {
     "lookup_transaction",
     {
       title: "Look up transaction",
+      annotations: { readOnlyHint: true },
       description:
         "Look up a transaction for a VERIFIED customer. Requires the customer_id returned by lookup_customer. transaction_reference is the reference the caller gives (e.g. TXN-9001); omit it to list the customer's recent transactions. Each result includes is_stale and agent_guidance — follow agent_guidance exactly. Never read reference numbers aloud; push them to the chat window instead.",
       inputSchema: z.object({
@@ -212,20 +213,18 @@ export function buildServer(ctx: CallContext): McpServer {
           const stale = isStale(t.status, t.estimated_arrival);
           return {
             transaction_id: t.transaction_id,
-            reference: t.transaction_id,
             type: t.transaction_type,
             amount: Number(t.amount),
             currency: t.currency,
             status: t.status,
             corridor: t.destination_country,
             estimated_arrival: t.estimated_arrival,
-            created_at: t.created_at,
             support_summary: t.support_summary,
             is_stale: stale,
             agent_guidance: guidanceFor(t.status, stale),
           };
         });
-        return { found: true, today_wat: todayWAT(), transactions };
+        return { found: true, transactions };
       },
     ),
   );
@@ -235,6 +234,7 @@ export function buildServer(ctx: CallContext): McpServer {
     "lookup_payout",
     {
       title: "Look up payout",
+      annotations: { readOnlyHint: true },
       description:
         "Look up a contractor/vendor payout for a VERIFIED customer. Requires the customer_id returned by lookup_customer. payout_reference is the reference the caller gives (e.g. PAY-7001); omit it to list the customer's recent payouts. The same stale-data rule as transactions applies — follow agent_guidance exactly.",
       inputSchema: z.object({
@@ -267,7 +267,6 @@ export function buildServer(ctx: CallContext): McpServer {
         const linked = p.transactions as unknown as { destination_country: string | null } | null;
         return {
           payout_id: p.payout_id,
-          reference: p.payout_id,
           linked_transaction: p.transaction_id,
           recipient_name: p.recipient_name,
           amount: Number(p.amount),
@@ -276,12 +275,11 @@ export function buildServer(ctx: CallContext): McpServer {
           destination_country: linked?.destination_country ?? null,
           estimated_arrival: p.scheduled_for,
           failure_reason: p.failure_reason,
-          created_at: p.created_at,
           is_stale: stale,
           agent_guidance: guidanceFor(p.status, stale),
         };
       });
-      return { found: true, today_wat: todayWAT(), payouts };
+      return { found: true, payouts };
     }),
   );
 
@@ -290,6 +288,7 @@ export function buildServer(ctx: CallContext): McpServer {
     "retrieve_knowledge",
     {
       title: "Retrieve approved knowledge",
+      annotations: { readOnlyHint: true },
       description:
         "Semantic search over RelayPay's approved knowledge base. Call this before answering ANY product, fee, timeline or policy question. Answer only from chunks where confident is true; if has_confident_match is false, the topic is outside the knowledge base — say you can't help with that specific topic and offer a ticket.",
       inputSchema: z.object({
@@ -468,14 +467,14 @@ export function buildServer(ctx: CallContext): McpServer {
         if (error || !data) throw new Error(error?.message ?? "escalation insert returned no row");
 
         if (conversationId) {
-          const { error: convErr } = await db
-            .from("conversations")
+          db.from("conversations")
             .update({ status: "escalated" })
-            .eq("conversation_id", conversationId);
-          if (convErr) console.error("[log] conversation status update failed:", convErr.message);
+            .eq("conversation_id", conversationId)
+            .then(({ error: convErr }) => convErr && console.error("[log] conversation status update failed:", convErr.message));
         }
 
-        const sent = await sendEscalationEmail({
+        // The email is sent after replying so the caller isn't kept waiting on it; notified_at records delivery.
+        void sendEscalationEmail({
           customerName: args.user_name,
           customerEmail: args.user_email,
           conversationId,
@@ -484,16 +483,16 @@ export function buildServer(ctx: CallContext): McpServer {
           category: args.category,
           reason: args.reason,
           preferredTime: args.preferred_time ?? null,
-        });
-        if (sent) {
-          await db.from("escalations").update({ notified_at: new Date().toISOString() }).eq("escalation_id", data.escalation_id);
-        }
+        })
+          .then(async (sent) => {
+            if (sent) await db.from("escalations").update({ notified_at: new Date().toISOString() }).eq("escalation_id", data.escalation_id);
+          })
+          .catch((err) => console.error("[email] escalation email failed:", err instanceof Error ? err.message : err));
 
         return {
           escalation_id: data.escalation_id,
-          created_at: data.created_at,
           status: data.status,
-          support_team_notified: sent,
+          support_team_notified: true,
           follow_up_summary: args.preferred_time
             ? `A specialist will follow up; the caller asked for a callback ${args.preferred_time}.`
             : "A specialist will follow up by email or phone.",

@@ -1,8 +1,10 @@
+import "./keepalive.js";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import express from "express";
 import { timingSafeEqual } from "node:crypto";
 import { config } from "./config.js";
+import { db } from "./db.js";
 import { buildServer, type CallContext } from "./tools.js";
 
 function header(req: Request | undefined, name: string): string | null {
@@ -38,7 +40,8 @@ app.get("/health", (_req, res) => {
 });
 
 app.use("/mcp", (req, res, next) => {
-  if (config.enforceHttps && req.protocol !== "https") {
+  // Railway's private network (*.railway.internal) is plain HTTP inside the project, so it is allowed too.
+  if (config.enforceHttps && req.protocol !== "https" && !req.hostname.endsWith(".railway.internal")) {
     res.status(403).json({ error: "HTTPS required" });
     return;
   }
@@ -55,6 +58,14 @@ app.all("/mcp", express.json({ limit: "1mb" }), (req, res) => {
   void mcpNodeHandler(req, res, req.body);
 });
 
-app.listen(config.port, () => {
+const server = app.listen(config.port, "::", () => {
   console.log(`RelayPay MCP server listening on :${config.port} (POST /mcp)`);
 });
+// Keep idle connections open between call turns so the webhook reuses them instead of reconnecting.
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+
+// A tiny query every 30 s keeps the pooled Supabase connection open between calls.
+setInterval(() => {
+  void db.from("knowledge_base").select("chunk_id", { head: true, count: "exact" }).limit(1);
+}, 30_000).unref();

@@ -1,6 +1,9 @@
+import "./keepalive.js";
 import cors from "cors";
 import express from "express";
 import { adminRouter } from "./adminApi.js";
+import { startAgentPool } from "./agentPool.js";
+import { getMcpTools, keepMcpConnectionWarm } from "./mcpClient.js";
 import { config } from "./config.js";
 import { publicRouter } from "./publicApi.js";
 import { vapiRouter } from "./vapi.js";
@@ -30,7 +33,16 @@ app.use("/api", cors({ origin: config.webOrigins }), publicRouter);
 // Called server-to-server by the Next.js admin proxy, so no CORS.
 app.use("/admin/api", adminRouter);
 
-app.listen(config.port, () => {
+// Warm everything a call turn needs before the first call arrives.
+keepMcpConnectionWarm();
+getMcpTools()
+  .then(() => startAgentPool())
+  .catch((err) => {
+    console.error("[boot] MCP tools unavailable; agent processes will start on demand:", err instanceof Error ? err.message : err);
+    startAgentPool();
+  });
+
+app.listen(config.port, "::", () => {
   console.log(`RelayPay webhook server listening on :${config.port}`);
   console.log(`  Vapi custom LLM URL:  <public-url>/vapi   (Vapi calls /vapi/chat/completions)`);
   console.log(`  Vapi server URL:      <public-url>/vapi/events`);
