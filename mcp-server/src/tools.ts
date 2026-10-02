@@ -4,6 +4,7 @@ import * as z from "zod";
 import { config } from "./config.js";
 import { db } from "./db.js";
 import { sendEscalationEmail } from "./email.js";
+import { checkCode, issueCode, verifiedCustomerId } from "./verification.js";
 import { embedQuery } from "./voyage.js";
 
 /** Per-request call context, set by the webhook server in request headers. */
@@ -106,33 +107,19 @@ function instrument<A>(ctx: CallContext, toolName: string, fn: (args: A) => Prom
   };
 }
 
-const UNKNOWN_CUSTOMER = {
+const NOT_VERIFIED = {
   found: false,
-  error: "unknown_customer",
-  message: "That customer is not recognised. Call lookup_customer with the caller's confirmed email, or pass that email here as customer_id.",
+  error: "not_verified",
+  message:
+    "The caller has not verified their identity on this call. Do not share any account information. Ask for their email, call lookup_customer to send a code, then verify_code.",
 };
-
-/** The customer_id for a customer_id or a (verified) email address, or null if there is no such customer. */
-async function resolveCustomerId(idOrEmail: string): Promise<string | null> {
-  const value = idOrEmail.trim();
-  const { data } = value.includes("@")
-    ? await db.from("customers").select("customer_id").eq("contact_email", value.toLowerCase()).maybeSingle()
-    : await db.from("customers").select("customer_id").eq("customer_id", value.toUpperCase()).maybeSingle();
-  return data?.customer_id ?? null;
-}
-
-async function customerExists(customerId: string | undefined | null): Promise<string | null> {
-  if (!customerId) return null;
-  const { data } = await db.from("customers").select("customer_id").eq("customer_id", customerId).maybeSingle();
-  return data?.customer_id ?? null;
-}
 
 export function buildServer(ctx: CallContext): McpServer {
   const server = new McpServer(
     { name: "relaypay-support", version: "1.0.0" },
     {
       instructions:
-        "RelayPay support tools for Jane. Verify the caller by email with lookup_customer before any account, transaction or payout lookup. Fields marked agent-context-only must never be spoken.",
+        "RelayPay support tools for Jane. Account, transaction and payout data is only available after the caller proves they own the account: lookup_customer emails them a code and verify_code checks it. Fields marked agent-context-only must never be spoken.",
     },
   );
 
@@ -140,52 +127,29 @@ export function buildServer(ctx: CallContext): McpServer {
   server.registerTool(
     "lookup_customer",
     {
-      title: "Look up customer",
-      annotations: { readOnlyHint: true },
+      title: "Start caller verification",
       description:
-        "Find a RelayPay customer by their email address (the only identity signal). Call this before any account, transaction or payout lookup. company_name is optional supporting context and can never trigger a lookup on its own. account_status, kyc_status and support_notes are AGENT CONTEXT ONLY and must never be spoken; only the email and plan may be read back for confirmation.",
+        "Step 1 of identity verification. Emails a 6-digit code to the RelayPay account with this email address. The answer is the same whether or not the email is registered, so never tell the caller whether an account exists. Tell them: \"If that email is on a RelayPay account, I've just sent a 6-digit code to it. Please read it out or type it in the chat.\" Then call verify_code. company_name is optional context and never identifies anyone.",
       inputSchema: z.object({
-        email: z.string().describe("Customer's email address as given by the caller"),
+        email: z.string().describe("Customer's email address as given by the caller (read back and confirmed first)"),
         company_name: z.string().optional().describe("Company name if the caller volunteered it"),
       }),
     },
-    instrument(ctx, "lookup_customer", async ({ email, company_name }: { email: string; company_name?: string }) => {
-      const normalized = email.trim().toLowerCase().replace(/\s+/g, "");
-      const { data, error } = await db
-        .from("customers")
-        .select("customer_id, contact_name, contact_email, company_name, plan, account_status, kyc_status, support_notes")
-        .eq("contact_email", normalized)
-        .maybeSingle();
-      if (error) throw new Error(error.message);
-      if (!data) {
-        return {
-          found: false,
-          message: "No customer account matches that email. Tell the caller you cannot find an account with that email and offer to create a ticket.",
-        };
-      }
+    instrument(ctx, "lookup_customer", async ({ email }: { email: string; company_name?: string }) => issueCode(ctx.conversationId, email)),
+  );
 
-      if (ctx.conversationId) {
-        db.from("conversations")
-          .update({ customer_id: data.customer_id, customer_email: data.contact_email })
-          .eq("conversation_id", ctx.conversationId)
-          .then(({ error: e }) => e && console.error("[log] conversation customer update failed:", e.message));
-      }
-
-      return {
-        found: true,
-        customer_id: data.customer_id,
-        name: data.contact_name,
-        email: data.contact_email,
-        company_name: data.company_name,
-        company_name_matches:
-          company_name === undefined ? null : company_name.trim().toLowerCase() === data.company_name.toLowerCase(),
-        plan: data.plan,
-        account_status: data.account_status,
-        kyc_status: data.kyc_status,
-        support_notes: data.support_notes,
-        next_step: `Confirm back: "I've found your account under ${data.contact_email} on the ${data.plan} plan — is that correct?" Proceed only after the caller confirms.`,
-      };
-    }),
+  // -------------------------------------------------------------------------
+  server.registerTool(
+    "verify_code",
+    {
+      title: "Verify caller code",
+      description:
+        "Step 2 of identity verification. Checks the 6-digit code the caller read out or typed. Pass it exactly as given (spoken words are fine). On success it returns the verified account; only then may you share account, transaction or payout information. account_status, kyc_status and support_notes are AGENT CONTEXT ONLY and must never be spoken.",
+      inputSchema: z.object({
+        code: z.string().describe('The code as the caller gave it, e.g. "482913" or "four eight two, nine one three"'),
+      }),
+    },
+    instrument(ctx, "verify_code", async ({ code }: { code: string }) => checkCode(ctx.conversationId, code)),
   );
 
   // -------------------------------------------------------------------------
@@ -195,18 +159,17 @@ export function buildServer(ctx: CallContext): McpServer {
       title: "Look up transaction",
       annotations: { readOnlyHint: true },
       description:
-        "Look up a transaction for a VERIFIED customer. Requires the customer_id returned by lookup_customer. transaction_reference is the reference the caller gives (e.g. TXN-9001); omit it to list the customer's recent transactions. Each result includes is_stale and agent_guidance — follow agent_guidance exactly. Never read reference numbers aloud; push them to the chat window instead.",
+        "Look up a transaction on the account this caller has verified (verify_code must have succeeded on this call; the account is taken from the verified call, never from your input). transaction_reference is the reference the caller gives (e.g. TXN-9001); omit it to list the customer's recent transactions. Each result includes is_stale and agent_guidance — follow agent_guidance exactly. Never read reference numbers aloud; push them to the chat window instead.",
       inputSchema: z.object({
-        customer_id: z.string().describe("customer_id from lookup_customer, or the caller's confirmed email address"),
         transaction_reference: z.string().optional().describe("Transaction reference, e.g. TXN-9001"),
       }),
     },
     instrument(
       ctx,
       "lookup_transaction",
-      async ({ customer_id, transaction_reference }: { customer_id: string; transaction_reference?: string }) => {
-        const customerId = customer_id.includes("@") ? await resolveCustomerId(customer_id) : customer_id.trim().toUpperCase();
-        if (!customerId) return UNKNOWN_CUSTOMER;
+      async ({ transaction_reference }: { transaction_reference?: string }) => {
+        const customerId = await verifiedCustomerId(ctx.conversationId);
+        if (!customerId) return NOT_VERIFIED;
         let query = db
           .from("transactions")
           .select("transaction_id, transaction_type, amount, currency, destination_country, status, created_at, estimated_arrival, support_summary")
@@ -219,7 +182,6 @@ export function buildServer(ctx: CallContext): McpServer {
         const { data, error } = await query;
         if (error) throw new Error(error.message);
         if (!data || data.length === 0) {
-          if (!(await resolveCustomerId(customerId))) return UNKNOWN_CUSTOMER;
           return {
             found: false,
             message: transaction_reference
@@ -254,15 +216,14 @@ export function buildServer(ctx: CallContext): McpServer {
       title: "Look up payout",
       annotations: { readOnlyHint: true },
       description:
-        "Look up a contractor/vendor payout for a VERIFIED customer. Requires the customer_id returned by lookup_customer. payout_reference is the reference the caller gives (e.g. PAY-7001); omit it to list the customer's recent payouts. The same stale-data rule as transactions applies — follow agent_guidance exactly.",
+        "Look up a contractor/vendor payout on the account this caller has verified (verify_code must have succeeded on this call; the account is taken from the verified call, never from your input). payout_reference is the reference the caller gives (e.g. PAY-7001); omit it to list the customer's recent payouts. The same stale-data rule as transactions applies — follow agent_guidance exactly.",
       inputSchema: z.object({
-        customer_id: z.string().describe("customer_id from lookup_customer, or the caller's confirmed email address"),
         payout_reference: z.string().optional().describe("Payout reference, e.g. PAY-7001"),
       }),
     },
-    instrument(ctx, "lookup_payout", async ({ customer_id, payout_reference }: { customer_id: string; payout_reference?: string }) => {
-      const customerId = customer_id.includes("@") ? await resolveCustomerId(customer_id) : customer_id.trim().toUpperCase();
-      if (!customerId) return UNKNOWN_CUSTOMER;
+    instrument(ctx, "lookup_payout", async ({ payout_reference }: { payout_reference?: string }) => {
+      const customerId = await verifiedCustomerId(ctx.conversationId);
+      if (!customerId) return NOT_VERIFIED;
       let query = db
         .from("payouts")
         .select("payout_id, transaction_id, recipient_name, amount, currency, status, scheduled_for, failure_reason, created_at, transactions(destination_country)")
@@ -275,7 +236,6 @@ export function buildServer(ctx: CallContext): McpServer {
       const { data, error } = await query;
       if (error) throw new Error(error.message);
       if (!data || data.length === 0) {
-        if (!(await resolveCustomerId(customerId))) return UNKNOWN_CUSTOMER;
         return {
           found: false,
           message: payout_reference
@@ -377,7 +337,6 @@ export function buildServer(ctx: CallContext): McpServer {
         "Create a support ticket for human follow-up. Use on its own for non-urgent issues (e.g. a failed invoice payment to investigate, a question outside the knowledge base). ALWAYS call this first when escalating — pass the returned ticket_id to create_escalation. Collect the caller's name and email before calling.",
       inputSchema: z.object({
         conversation_id: z.string().optional().describe("Ignored if the server already knows the conversation"),
-        customer_id: z.string().optional().describe("customer_id from lookup_customer, if verified"),
         user_name: z.string().describe("Caller's name"),
         user_email: z.string().describe("Caller's email"),
         subject: z.string().describe("Short subject line"),
@@ -394,7 +353,6 @@ export function buildServer(ctx: CallContext): McpServer {
       "create_ticket",
       async (args: {
         conversation_id?: string;
-        customer_id?: string;
         user_name: string;
         user_email: string;
         subject: string;
@@ -402,14 +360,18 @@ export function buildServer(ctx: CallContext): McpServer {
         category?: string;
         priority?: "low" | "normal" | "high" | "urgent";
       }) => {
+        // The account comes from the verified call only; an unverified caller's ticket says so.
+        const verifiedId = await verifiedCustomerId(ctx.conversationId);
         const row = {
           conversation_id: ctx.conversationId ?? asUuid(args.conversation_id),
-          customer_id: await customerExists(args.customer_id),
+          customer_id: verifiedId,
           source: "voice",
           user_name: args.user_name,
           user_email: args.user_email.trim().toLowerCase(),
           subject: args.subject,
-          description: args.description,
+          description: verifiedId
+            ? args.description
+            : `[Identity not verified on this call: contact the customer only through the email on their account, not details given on the call.] ${args.description}`,
           category: args.category ?? null,
           priority: args.priority ?? "normal",
         };
@@ -438,7 +400,6 @@ export function buildServer(ctx: CallContext): McpServer {
       inputSchema: z.object({
         ticket_id: z.string().describe("ticket_id returned by create_ticket"),
         conversation_id: z.string().optional().describe("Ignored if the server already knows the conversation"),
-        customer_id: z.string().optional(),
         user_name: z.string(),
         user_email: z.string(),
         category: z.enum(ESCALATION_CATEGORIES),
@@ -454,7 +415,6 @@ export function buildServer(ctx: CallContext): McpServer {
       async (args: {
         ticket_id: string;
         conversation_id?: string;
-        customer_id?: string;
         user_name: string;
         user_email: string;
         category: (typeof ESCALATION_CATEGORIES)[number];
@@ -475,7 +435,7 @@ export function buildServer(ctx: CallContext): McpServer {
           .insert({
             ticket_id: ticket.ticket_id,
             conversation_id: ticket.conversation_id ?? null,
-            customer_id: await customerExists(args.customer_id),
+            customer_id: await verifiedCustomerId(ctx.conversationId),
             user_name: args.user_name,
             user_email: args.user_email.trim().toLowerCase(),
             category: args.category,

@@ -78,7 +78,7 @@ cp .env.example .env          # fill in the values
 ## Key behaviors
 
 - **Grounding.** `retrieve_knowledge` withholds the content of chunks below the similarity threshold, so Jane cannot answer from low-confidence results. Every search is written to `retrieval_logs`.
-- **Identity.** Email is the only identifier. Lookups require the `customer_id` from `lookup_customer`, and records belonging to another customer come back as not found. `account_status`, `kyc_status` and `support_notes` are never spoken.
+- **Identity.** Knowing an email isn't proof. `lookup_customer` emails a 6-digit code to the account's address (same reply whether or not the email exists), and `verify_code` checks it: 5 tries per code, 3 codes per call, 10-minute expiry, stored hashed. The verified customer is saved on the conversation, and transaction, payout, ticket and escalation tools use that, never an ID from the model. Codes for `.example` test addresses go to `DEMO_OTP_INBOX`. `account_status`, `kyc_status` and `support_notes` are never spoken.
 - **Stale data.** The MCP server computes `is_stale`: estimated arrival (payouts: `scheduled_for`) is before today in WAT, and the status is processing, delayed or review required. Jane escalates these with `stale_data` instead of reading them out.
 - **Escalations.** `create_ticket` runs first, then `create_escalation` (which requires `ticket_id`). The support inbox is emailed and the conversation is marked `escalated`.
 - **Limits.** 10 customer turns or 8 minutes. Wrap-up starts at 7 minutes (`WRAP_UP_AFTER_SECONDS`), and Vapi's `maxDurationSeconds=480` is the hard stop.

@@ -6,7 +6,7 @@ import type { ToolTiming, TurnTimer } from "./latency.js";
 
 export type { TurnIdentity } from "./agentPool.js";
 
-const REMEMBERED_TOOLS = new Set(["lookup_customer", "lookup_transaction", "lookup_payout"]);
+const REMEMBERED_TOOLS = new Set(["verify_code", "lookup_transaction", "lookup_payout"]);
 
 export interface ToolOutcome {
   name: string;
@@ -155,7 +155,7 @@ async function runOnSpare(
           const isError = Boolean(block.is_error) || text.includes('"error":"technical_error"');
           if (isError) hadToolError = true;
           if (name) toolResults.push({ name, input: pendingToolInputs.get(block.tool_use_id), output: text, isError });
-          if (name && REMEMBERED_TOOLS.has(name) && !isError && text.includes('"found":true')) {
+          if (name && REMEMBERED_TOOLS.has(name) && !isError && (text.includes('"found":true') || text.includes('"verified":true'))) {
             rememberLookup(turn.vapiCallId, name, pendingToolInputs.get(block.tool_use_id), text);
           }
           if (name === "retrieve_knowledge") {

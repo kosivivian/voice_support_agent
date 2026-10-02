@@ -1,11 +1,12 @@
 # RelayPay MCP Server
 
-The MCP server behind **Jane**, RelayPay's AI voice support agent. It is the only part of the system that reads customer, transaction and payout data. It exposes 7 tools over **Streamable HTTP** (stateless; no session handshake needed).
+The MCP server behind **Jane**, RelayPay's AI voice support agent. It is the only part of the system that reads customer, transaction and payout data. It exposes 8 tools over **Streamable HTTP** (stateless; no session handshake needed).
 
 | Tool | What it does |
 | --- | --- |
-| `lookup_customer` | Verifies a caller by email (the only identity signal). Returns `customer_id`, plan, and agent-only context fields. |
-| `lookup_transaction` | A verified customer's transaction by reference (e.g. `TXN-9001`), or their recent transactions. Records owned by another customer come back as not found. |
+| `lookup_customer` | Step 1 of caller verification: emails a 6-digit code to the account with this email. Returns the same answer whether or not the email is registered. |
+| `verify_code` | Step 2: checks the code the caller read out or typed (spoken digits are fine). On success the conversation is marked verified and the account summary is returned. 5 tries per code, 3 codes per call, 10-minute expiry. |
+| `lookup_transaction` | A transaction on the **verified caller's** account by reference (e.g. `TXN-9001`), or their recent ones. The account comes from the verified conversation, never from tool input; before verification it returns `not_verified`. |
 | `lookup_payout` | Same as above for payouts (e.g. `PAY-7001`). |
 | `retrieve_knowledge` | Semantic search over the RelayPay knowledge base (Voyage embeddings + pgvector). Chunks below the similarity threshold are withheld so the agent can't answer from weak matches. |
 | `create_ticket` | Creates a support ticket. |
@@ -42,8 +43,10 @@ curl -s -X POST $URL -H "x-api-key: $KEY" \
   -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
-# Call a tool
-curl -s -X POST $URL -H "x-api-key: $KEY" \
+# Call a tool. x-conversation-id ties verification to one call: use any new UUID,
+# and keep the same one for lookup_customer -> verify_code -> lookup_transaction.
+CALL=$(node -e "console.log(crypto.randomUUID())")
+curl -s -X POST $URL -H "x-api-key: $KEY" -H "x-conversation-id: $CALL" \
   -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"lookup_customer","arguments":{"email":"amara@lagosledger.example"}}}'
 ```
@@ -73,9 +76,12 @@ cp .env.example .env
    | `VOYAGE_API_KEY` | yes | Voyage AI dashboard |
    | `VOYAGE_MODEL` | no | Default `voyage-3.5-lite` |
    | `KB_SIMILARITY_THRESHOLD` | no | Default `0.5` |
-   | `RESEND_API_KEY`, `EMAIL_FROM`, `SUPPORT_EMAIL` | no | For escalation emails |
+   | `RESEND_API_KEY`, `EMAIL_FROM` | for codes | Sends verification codes and escalation emails. `EMAIL_FROM` must use a domain verified in Resend |
+   | `SUPPORT_EMAIL` | no | Extra recipient for escalation emails |
+   | `OTP_SECRET` | recommended | Secret for hashing verification codes (falls back to `MCP_API_KEY`) |
+   | `DEMO_OTP_INBOX` | for testing | Inbox that receives codes for the `.example` test customers |
 
-2. **Create the schema.** In Supabase → SQL Editor, run [`supabase/migrations/001_schema.sql`](../supabase/migrations/001_schema.sql).
+2. **Create the schema.** In Supabase → SQL Editor, run the files in [`supabase/migrations/`](../supabase/migrations/) in order, `001` to `005`.
 
 3. **Load the data:**
 
@@ -104,11 +110,13 @@ cp .env.example .env
 
 | Tool | Arguments | Expected |
 | --- | --- | --- |
-| `lookup_customer` | `{"email":"amara@lagosledger.example"}` | Found: `CUS-1001`, Growth plan |
-| `lookup_customer` | `{"email":"nobody@example.com"}` | `found: false` |
-| `lookup_transaction` | `{"customer_id":"CUS-1002","transaction_reference":"TXN-9002"}` | Completed |
-| `lookup_transaction` | `{"customer_id":"CUS-1002","transaction_reference":"TXN-9001"}` | Not found (belongs to another customer) |
-| `lookup_payout` | `{"customer_id":"CUS-1004","payout_reference":"PAY-7003"}` | Failed: beneficiary details need review |
+| `lookup_customer` | `{"email":"amara@lagosledger.example"}` | `code_sent: true` (code emailed to `DEMO_OTP_INBOX`, since this is a test address) |
+| `lookup_customer` | `{"email":"nobody@example.com"}` | The same `code_sent: true` reply: nothing reveals the email isn't registered |
+| `lookup_transaction` | `{"transaction_reference":"TXN-9001"}` before verifying | `not_verified` |
+| `verify_code` | `{"code":"000000"}` | `wrong_code`, `attempts_left: 4` |
+| `verify_code` | `{"code":"<code from the email>"}` | `verified: true`, `CUS-1001`, Growth plan |
+| `lookup_transaction` | `{"transaction_reference":"TXN-9001"}` after verifying | Processing, overdue |
+| `lookup_transaction` | `{"transaction_reference":"TXN-9002"}` after verifying as Amara | Not found (belongs to another customer) |
 | `retrieve_knowledge` | `{"query":"What fees apply to international payments?"}` | Confident match from the knowledge base |
 | `retrieve_knowledge` | `{"query":"What is the weather in Lagos?"}` | `has_confident_match: false` |
 | `create_ticket` | `{"user_name":"Test","user_email":"test@example.com","subject":"Test","description":"Grader test"}` | Returns `ticket_id` |

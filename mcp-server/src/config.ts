@@ -15,6 +15,10 @@ export const config = {
   resendApiKey: process.env.RESEND_API_KEY ?? "",
   emailFrom: process.env.EMAIL_FROM ?? "RelayPay Support <onboarding@resend.dev>",
   supportEmail: process.env.SUPPORT_EMAIL ?? "",
+  // Secret for hashing verification codes. Falls back to MCP_API_KEY so a missing value never stores codes unhashed.
+  otpSecret: process.env.OTP_SECRET || required("MCP_API_KEY"),
+  // Codes for test addresses ending in .example (which can't receive mail) go here instead.
+  demoOtpInbox: (process.env.DEMO_OTP_INBOX ?? "").trim(),
   // Reject plain-HTTP requests when running behind a TLS-terminating proxy (Railway).
   enforceHttps: process.env.NODE_ENV === "production",
 };

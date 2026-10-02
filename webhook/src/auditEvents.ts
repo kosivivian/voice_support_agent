@@ -30,10 +30,19 @@ export function deriveAuditEvents(results: ToolOutcome[], wrapUp: string | null)
     if (!out) continue;
     const input = (r.input ?? {}) as Record<string, unknown>;
     if (r.name === "lookup_customer") {
+      // Logged the same way whether or not the email exists, matching what the caller hears.
       events.push(
-        out.found
-          ? { event_type: "identity_verified", summary: `Account found for ${String(out.email ?? input.email)}.`, metadata: { customer_id: out.customer_id } }
-          : { event_type: "identity_failed", summary: `No account found for ${String(input.email ?? "the given email")}.` },
+        out.code_sent
+          ? { event_type: "verification_code_requested", summary: `Verification code requested for ${String(input.email ?? "an email")}.` }
+          : { event_type: "verification_code_refused", summary: String(out.message ?? "Code not sent.") },
+      );
+    } else if (r.name === "verify_code") {
+      events.push(
+        out.verified
+          ? { event_type: "identity_verified", summary: `Caller verified as ${String(out.email)} by email code.`, metadata: { customer_id: out.customer_id } }
+          : out.error === "locked"
+            ? { event_type: "verification_locked", summary: "Too many wrong codes; account details withheld." }
+            : { event_type: "identity_failed", summary: `Code check failed (${String(out.error ?? "unknown")}).` },
       );
     } else if (r.name === "retrieve_knowledge" && out.has_confident_match === false) {
       events.push({ event_type: "declined_out_of_scope", summary: `No confident knowledge base match for "${String(input.query ?? "")}".` });

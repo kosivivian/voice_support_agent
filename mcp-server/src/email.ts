@@ -60,3 +60,32 @@ ${rows
   }
   return true;
 }
+
+/** Emails a caller-verification code to the address on file (test .example addresses go to DEMO_OTP_INBOX). */
+export async function sendVerificationCode(email: string, code: string): Promise<boolean> {
+  const isTestAddress = email.toLowerCase().endsWith(".example");
+  const to = isTestAddress ? config.demoOtpInbox : email;
+  if (!resend || !to) {
+    console.error(`[email] verification code not sent: ${!resend ? "RESEND_API_KEY missing" : "DEMO_OTP_INBOX not set for test address"}`);
+    return false;
+  }
+  const spaced = `${code.slice(0, 3)} ${code.slice(3)}`;
+  const testNote = isTestAddress ? `<p style="color:#8a5a00">Test account: this code is for ${escapeHtml(email)}.</p>` : "";
+  const { error } = await resend.emails.send({
+    from: config.emailFrom,
+    to,
+    subject: `Your RelayPay support code: ${spaced}`,
+    text: `Your RelayPay support code is ${spaced}. It expires in 10 minutes.\n\nGive it to Jane, our support assistant, to confirm it's you. If you didn't request it, you can ignore this email.`,
+    html: `<div style="font-family:Inter,Arial,sans-serif;color:#111827;font-size:15px;line-height:1.5">
+<p>Your RelayPay support code is</p>
+<p style="font-size:28px;font-weight:700;letter-spacing:4px;color:#12305f;margin:8px 0">${spaced}</p>
+<p>It expires in 10 minutes. Give it to Jane, our support assistant, to confirm it's you.</p>
+<p style="color:#5b6472">If you didn't request it, you can ignore this email. RelayPay will never ask for this code outside a support call you started.</p>
+${testNote}</div>`,
+  });
+  if (error) {
+    console.error("[email] verification code email failed:", error);
+    return false;
+  }
+  return true;
+}
