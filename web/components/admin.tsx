@@ -1,6 +1,7 @@
 "use client";
 
 import styles from "@/app/admin/admin.module.css";
+import { useLiveStatus } from "@/lib/adminLive";
 
 export function PageHeader({ title, description, onRefresh }: { title: string; description?: string; onRefresh?: () => void }) {
   return (
@@ -13,12 +14,25 @@ export function PageHeader({ title, description, onRefresh }: { title: string; d
           </p>
         ) : null}
       </div>
-      {onRefresh ? (
-        <button className="btn btn-secondary btn-sm" onClick={onRefresh}>
-          Refresh
-        </button>
-      ) : null}
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <LiveIndicator />
+        {onRefresh ? (
+          <button className="btn btn-secondary btn-sm" onClick={onRefresh}>
+            Refresh
+          </button>
+        ) : null}
+      </div>
     </div>
+  );
+}
+
+function LiveIndicator() {
+  const live = useLiveStatus();
+  return (
+    <span className="muted small" style={{ display: "inline-flex", alignItems: "center", gap: 6 }} title={live ? "Updates appear automatically" : "Reconnecting to live updates"}>
+      <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: "50%", background: live ? "var(--teal-600)" : "var(--border-strong)" }} />
+      {live ? "Live" : "Connecting…"}
+    </span>
   );
 }
 

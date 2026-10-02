@@ -57,6 +57,7 @@ cp .env.example .env          # fill in the values
    ```
    Vapi must reach the webhook over HTTPS. For local calls run `ngrok http 8787` and use that URL.
 7. **Vapi.** Follow [docs/VAPI_SETUP.md](docs/VAPI_SETUP.md).
+8. **Live admin updates (Supabase Realtime).** Run `supabase/migrations/002_admin_live_updates.sql` in the Supabase SQL Editor. Set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` for the web app (`web/.env.local` locally, Vercel in production). Every change to the logged tables then broadcasts a `{ table, type }` signal on the `admin-dashboard` Realtime channel, and open admin pages re-fetch automatically.
 
 ## Deploy
 
@@ -72,7 +73,7 @@ cp .env.example .env          # fill in the values
 - Variables: `ANTHROPIC_API_KEY`, `AGENT_MODEL`, `AGENT_EFFORT`, `SUMMARY_MODEL`, `MCP_SERVER_URL` (the MCP service URL, without `/mcp`), `MCP_API_KEY`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `ADMIN_JWT_SECRET`, `VAPI_WEBHOOK_SECRET`, `RESEND_API_KEY`, `EMAIL_FROM`, `SUPPORT_EMAIL`, `WEB_ORIGIN` (your Vercel URL), `NODE_ENV=production`
 
 **Web (Vercel).** Root directory: `web`.
-- Variables: `NEXT_PUBLIC_VAPI_PUBLIC_KEY`, `NEXT_PUBLIC_VAPI_ASSISTANT_ID`, `NEXT_PUBLIC_WEBHOOK_URL`, `WEBHOOK_URL` (both set to the webhook Railway URL)
+- Variables: `NEXT_PUBLIC_VAPI_PUBLIC_KEY`, `NEXT_PUBLIC_VAPI_ASSISTANT_ID`, `NEXT_PUBLIC_WEBHOOK_URL`, `WEBHOOK_URL` (both set to the webhook Railway URL), `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`
 
 ## Key behaviors
 
