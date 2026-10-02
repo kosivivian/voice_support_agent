@@ -67,8 +67,10 @@ export interface Ticket {
   description: string;
   category: string | null;
   priority: string;
-  status: string;
+  status: "open" | "processing" | "resolved" | "closed";
   created_at: string;
+  urgent?: boolean;
+  escalations?: { escalation_id: string; category: string; status: string; preferred_time: string | null }[];
 }
 
 export interface Escalation {

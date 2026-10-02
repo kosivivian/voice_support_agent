@@ -4,16 +4,11 @@ import { db } from "./db.js";
 
 const resend = config.resendApiKey ? new Resend(config.resendApiKey) : null;
 
-/** Active customer-support staff email, falling back to SUPPORT_EMAIL. */
-export async function supportRecipient(): Promise<string | null> {
-  const { data } = await db
-    .from("staff")
-    .select("email")
-    .eq("role", "customer_support")
-    .eq("is_active", true)
-    .limit(1)
-    .maybeSingle();
-  return data?.email ?? (config.supportEmail || null);
+/** Every active customer-support staff email (plus SUPPORT_EMAIL), deduplicated. */
+export async function supportRecipients(): Promise<string[]> {
+  const { data } = await db.from("staff").select("email").eq("role", "customer_support").eq("is_active", true);
+  const emails = [...(data ?? []).map((s) => s.email as string), config.supportEmail].map((e) => e?.trim().toLowerCase()).filter(Boolean);
+  return [...new Set(emails)];
 }
 
 const escapeHtml = (s: string) =>
@@ -29,8 +24,8 @@ export async function sendEscalationEmail(fields: {
   reason: string;
   preferredTime: string | null;
 }): Promise<boolean> {
-  const to = await supportRecipient();
-  if (!resend || !to) {
+  const to = await supportRecipients();
+  if (!resend || to.length === 0) {
     console.error("[email] Resend or support recipient not configured; escalation email skipped");
     return false;
   }

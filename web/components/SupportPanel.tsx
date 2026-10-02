@@ -3,13 +3,16 @@
 import Vapi from "@vapi-ai/web";
 import { useCallback, useEffect, useRef, useState } from "react";
 import styles from "./SupportPanel.module.css";
+import { VoiceOrb, type OrbMode } from "./VoiceOrb";
 
 const VAPI_PUBLIC_KEY = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY ?? "";
 const VAPI_ASSISTANT_ID = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID ?? "";
 const WEBHOOK_URL = (process.env.NEXT_PUBLIC_WEBHOOK_URL ?? "").replace(/\/+$/, "");
 const START_TIMEOUT_MS = 20_000;
+const TYPED_PREFIX = "[Typed in chat] ";
 
 type CallState = "idle" | "connecting" | "active" | "ended" | "fallback";
+type Speaker = "you" | "jane";
 
 interface JaneMessage {
   id: string;
@@ -18,9 +21,24 @@ interface JaneMessage {
   sentAt: string;
 }
 
-type ChatItem = ({ from: "jane" } & JaneMessage) | { from: "you"; id: string; body: string; sentAt: string };
+type ConversationItem =
+  | { kind: "line"; id: string; speaker: Speaker; text: string }
+  | { kind: "typed"; id: string; text: string }
+  | ({ kind: "card" } & JaneMessage);
 
-const TYPED_PREFIX = "[Typed in chat] ";
+interface TranscriptEvent {
+  type?: string;
+  role?: "assistant" | "user";
+  transcriptType?: "partial" | "final";
+  transcript?: string;
+}
+
+const HELP_TOPICS = [
+  "Payment and payout status",
+  "Fees, limits and timelines",
+  "Invoices and account questions",
+  "Connecting you with a specialist",
+];
 
 function describeFailure(err: unknown): string {
   if (err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "SecurityError")) {
@@ -35,7 +53,9 @@ function describeFailure(err: unknown): string {
 export function SupportPanel() {
   const [state, setState] = useState<CallState>("idle");
   const [speaking, setSpeaking] = useState(false);
-  const [messages, setMessages] = useState<ChatItem[]>([]);
+  const [muted, setMuted] = useState(false);
+  const [items, setItems] = useState<ConversationItem[]>([]);
+  const [partial, setPartial] = useState<Partial<Record<Speaker, string>>>({});
   const [failureReason, setFailureReason] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
 
@@ -43,6 +63,12 @@ export function SupportPanel() {
   const stateRef = useRef<CallState>("idle");
   const streamRef = useRef<EventSource | null>(null);
   const startTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const janeLevel = useRef(0);
+  const callerLevel = useRef(0);
+  const orbLevel = useRef(0);
+  const speakingRef = useRef(false);
+  const mutedRef = useRef(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const setCallState = (next: CallState) => {
     stateRef.current = next;
@@ -69,15 +95,52 @@ export function SupportPanel() {
     };
   }, []);
 
+  // The orb follows whoever is talking; a muted caller contributes nothing.
+  useEffect(() => {
+    let frame = 0;
+    const tick = () => {
+      orbLevel.current = speakingRef.current ? janeLevel.current : mutedRef.current ? 0 : callerLevel.current;
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [items, partial]);
+
   const subscribeToJane = (callId: string) => {
     if (!WEBHOOK_URL) return;
     closeStream();
     const es = new EventSource(`${WEBHOOK_URL}/api/chat-stream/${encodeURIComponent(callId)}`);
     es.addEventListener("jane-message", (event) => {
       const push = JSON.parse((event as MessageEvent).data) as JaneMessage;
-      setMessages((prev) => (prev.some((m) => m.id === push.id) ? prev : [...prev, { from: "jane", ...push }]));
+      setItems((prev) => (prev.some((m) => m.id === push.id) ? prev : [...prev, { kind: "card", ...push }]));
     });
     streamRef.current = es;
+  };
+
+  const onTranscript = (m: TranscriptEvent) => {
+    if (!m.type?.startsWith("transcript") || !m.role || !m.transcript) return;
+    const speaker: Speaker = m.role === "user" ? "you" : "jane";
+    // Typed messages show up in the transcript too; they are already listed as typed.
+    if (m.transcript.startsWith(TYPED_PREFIX.trim())) return;
+    if (m.transcriptType === "final") {
+      const text = m.transcript.trim();
+      setPartial((p) => ({ ...p, [speaker]: undefined }));
+      setItems((prev) => [...prev, { kind: "line", id: crypto.randomUUID(), speaker, text }]);
+    } else {
+      setPartial((p) => ({ ...p, [speaker]: m.transcript }));
+    }
+  };
+
+  const resetCallUi = () => {
+    setSpeaking(false);
+    speakingRef.current = false;
+    setMuted(false);
+    mutedRef.current = false;
+    setPartial({});
   };
 
   const startCall = async () => {
@@ -91,7 +154,8 @@ export function SupportPanel() {
     }
 
     setCallState("connecting");
-    setMessages([]);
+    setItems([]);
+    resetCallUi();
 
     try {
       // Ask for the microphone up front so a denial is detected clearly.
@@ -109,12 +173,25 @@ export function SupportPanel() {
         setCallState("active");
       });
       vapi.on("call-end", () => {
-        setSpeaking(false);
+        resetCallUi();
         closeStream();
         if (stateRef.current !== "fallback") setCallState("ended");
       });
-      vapi.on("speech-start", () => setSpeaking(true));
-      vapi.on("speech-end", () => setSpeaking(false));
+      vapi.on("speech-start", () => {
+        speakingRef.current = true;
+        setSpeaking(true);
+      });
+      vapi.on("speech-end", () => {
+        speakingRef.current = false;
+        setSpeaking(false);
+      });
+      vapi.on("volume-level", (v) => {
+        janeLevel.current = v;
+      });
+      vapi.on("local-volume-level", (v) => {
+        callerLevel.current = v;
+      });
+      vapi.on("message", (m) => onTranscript(m as TranscriptEvent));
       vapi.on("call-start-failed", (event) => fallBack(describeFailure(event?.error ?? "call failed to start")));
       vapi.on("error", (err) => {
         // Errors before the call is live mean voice could not initialise.
@@ -144,60 +221,93 @@ export function SupportPanel() {
     vapiRef.current?.stop().catch(() => undefined);
   };
 
+  const toggleMute = () => {
+    if (!vapiRef.current || stateRef.current !== "active") return;
+    const next = !mutedRef.current;
+    vapiRef.current.setMuted(next);
+    mutedRef.current = next;
+    setMuted(next);
+  };
+
   const sendTyped = (e: React.FormEvent) => {
     e.preventDefault();
     const text = draft.trim();
     if (!text || stateRef.current !== "active" || !vapiRef.current) return;
     vapiRef.current.send({ type: "add-message", message: { role: "user", content: TYPED_PREFIX + text } });
-    setMessages((prev) => [...prev, { from: "you", id: crypto.randomUUID(), body: text, sentAt: new Date().toISOString() }]);
+    setItems((prev) => [...prev, { kind: "typed", id: crypto.randomUUID(), text }]);
     setDraft("");
   };
 
   const inCall = state === "connecting" || state === "active";
+  const orbMode: OrbMode =
+    state === "connecting" ? "connecting" : state !== "active" ? "idle" : speaking ? "speaking" : muted ? "muted" : "listening";
+  const statusText =
+    state === "active"
+      ? speaking
+        ? "Jane is speaking"
+        : muted
+          ? "You're muted. Jane can't hear you."
+          : "Listening"
+      : state === "connecting"
+        ? "Connecting…"
+        : state === "ended"
+          ? "Call ended"
+          : state === "fallback"
+            ? "Voice unavailable"
+            : "Tap the mic to talk";
 
   return (
-    <div className={styles.grid}>
-      <section className={`card ${styles.callCard}`} aria-labelledby="talk-heading">
+    <div className={styles.layout}>
+      <section className={styles.intro} aria-labelledby="talk-heading">
         <h1 id="talk-heading" className={styles.title}>
-          RelayPay Support
+          Talk to Jane, RelayPay&apos;s support assistant
         </h1>
         <p className={styles.lede}>
-          Jane is RelayPay&apos;s AI support assistant. She can help with payments, payouts, fees, and account questions.
+          Ask about your payments, payouts, fees or account. Jane answers from RelayPay&apos;s approved help content and
+          connects you with a specialist when you need one.
         </p>
+        <ul className={styles.topics}>
+          {HELP_TOPICS.map((t) => (
+            <li key={t}>{t}</li>
+          ))}
+        </ul>
+        <p className={`muted small ${styles.disclosure}`}>
+          Jane is an AI assistant. Calls are logged so our support team can review them. Never share passwords or full
+          card numbers.
+        </p>
+      </section>
 
-        <div className={styles.indicator} role="status" aria-live="polite">
-          <span className={`${styles.dot} ${state === "active" ? styles.dotActive : state === "connecting" ? styles.dotConnecting : ""}`} />
-          <span>
-            {state === "active"
-              ? speaking
-                ? "Call active · Jane is speaking"
-                : "Call active · listening"
-              : state === "connecting"
-                ? "Connecting…"
-                : state === "ended"
-                  ? "Call ended"
-                  : state === "fallback"
-                    ? "Voice unavailable"
-                    : "Call inactive"}
-          </span>
-        </div>
-
+      <section className={`card ${styles.callCard}`} aria-label="Voice call">
+        <VoiceOrb mode={orbMode} level={orbLevel} />
+        <p className={styles.status} role="status" aria-live="polite">
+          {statusText}
+        </p>
         {state === "fallback" ? (
-          <p className="muted small">Voice could not start ({failureReason}). You can leave a message instead.</p>
+          <p className="muted small" style={{ textAlign: "center", margin: 0 }}>
+            Voice could not start ({failureReason}). You can leave a message instead.
+          </p>
         ) : inCall ? (
-          <button className="btn btn-danger" onClick={endCall}>
-            End call
-          </button>
+          <div className={styles.controls}>
+            <button
+              className={`btn ${muted ? "btn-primary" : "btn-secondary"}`}
+              onClick={toggleMute}
+              disabled={state !== "active"}
+              aria-pressed={muted}
+            >
+              {muted ? <MicIcon /> : <MicOffIcon />}
+              {muted ? "Unmute" : "Mute"}
+            </button>
+            <button className="btn btn-danger" onClick={endCall}>
+              <PhoneIcon />
+              End call
+            </button>
+          </div>
         ) : (
-          <button className="btn btn-primary" onClick={startCall}>
-            {state === "ended" ? "Talk to Jane again" : "Talk to Jane"}
+          <button className={styles.micButton} onClick={startCall} aria-label={state === "ended" ? "Talk to Jane again" : "Talk to Jane"}>
+            <MicIcon size={26} />
           </button>
         )}
-
-        <p className={`muted small ${styles.disclosure}`}>
-          Jane is an AI assistant. Calls are logged so our support team can review them. For account, compliance or
-          dispute questions she will connect you with a specialist.
-        </p>
+        {state === "ended" ? <p className="muted small" style={{ margin: 0 }}>Tap the mic to start a new call.</p> : null}
       </section>
 
       <section className={`card ${styles.chatCard}`} aria-labelledby="chat-heading">
@@ -207,38 +317,40 @@ export function SupportPanel() {
           <>
             <div className={styles.chatHeader}>
               <h2 id="chat-heading" className={styles.chatTitle}>
-                Chat
+                Conversation
               </h2>
-              <span className="muted small">{state === "active" ? "Type during the call" : "Available during a call"}</span>
+              <span className="muted small">{state === "active" ? "Live transcript" : "Shown during a call"}</span>
             </div>
-            <div className={styles.chatBody} aria-live="polite">
-              {messages.length === 0 ? (
+            <div className={styles.chatBody} ref={scrollRef} aria-live="polite">
+              {items.length === 0 && !partial.you && !partial.jane ? (
                 <p className="muted small">
                   {inCall
-                    ? "Type your email or other details here if they're hard to say. Reference numbers Jane shares will appear here instead of being read aloud."
-                    : "Start a call with Jane. You can type details here during the call, and reference numbers she shares will appear here."}
+                    ? "What you and Jane say appears here. If something is hard to say, like an email address, type it below."
+                    : "Start a call to see the live transcript. You can also type details here during the call."}
                 </p>
-              ) : (
-                messages.map((m) => {
-                  const time = (
-                    <time className="muted small" dateTime={m.sentAt}>
-                      {new Date(m.sentAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                    </time>
-                  );
-                  return m.from === "jane" ? (
-                    <article key={m.id} className={styles.push}>
-                      <div className={styles.pushTitle}>{m.title}</div>
-                      <div className={styles.pushBody}>{m.body}</div>
-                      {time}
-                    </article>
-                  ) : (
-                    <article key={m.id} className={styles.typed}>
-                      <div className={styles.pushTitle}>You typed</div>
-                      <div className={styles.typedBody}>{m.body}</div>
-                      {time}
-                    </article>
-                  );
-                })
+              ) : null}
+              {items.map((item) =>
+                item.kind === "card" ? (
+                  <article key={item.id} className={styles.push}>
+                    <div className={styles.pushTitle}>{item.title}</div>
+                    <div className={styles.pushBody}>{item.body}</div>
+                  </article>
+                ) : (
+                  <div key={item.id} className={styles.line}>
+                    <span className={`${styles.speaker} ${item.kind === "line" && item.speaker === "jane" ? styles.speakerJane : ""}`}>
+                      {item.kind === "typed" ? "You (typed)" : item.speaker === "jane" ? "Jane" : "You"}
+                    </span>
+                    <span>{item.text}</span>
+                  </div>
+                ),
+              )}
+              {(["you", "jane"] as const).map((s) =>
+                partial[s] ? (
+                  <div key={s} className={`${styles.line} ${styles.partial}`}>
+                    <span className={`${styles.speaker} ${s === "jane" ? styles.speakerJane : ""}`}>{s === "jane" ? "Jane" : "You"}</span>
+                    <span>{partial[s]}</span>
+                  </div>
+                ) : null,
               )}
             </div>
             <form className={styles.composer} onSubmit={sendTyped}>
@@ -263,6 +375,31 @@ export function SupportPanel() {
         )}
       </section>
     </div>
+  );
+}
+
+function MicIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
+    </svg>
+  );
+}
+
+function MicOffIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M15 9.3V6a3 3 0 0 0-5.7-1.3M9 9v2a3 3 0 0 0 4.6 2.5M19 11a7 7 0 0 1-1.2 3.9M5 11a7 7 0 0 0 10.6 6M12 18v3M3 3l18 18" />
+    </svg>
+  );
+}
+
+function PhoneIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 15.5c4.7-3.3 11.3-3.3 16 0l-1.6 2.6a1 1 0 0 1-1.3.4l-2.4-1.1a1 1 0 0 1-.6-.9v-1.6a12 12 0 0 0-4.2 0v1.6a1 1 0 0 1-.6.9l-2.4 1.1a1 1 0 0 1-1.3-.4z" />
+    </svg>
   );
 }
 

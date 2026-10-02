@@ -180,7 +180,18 @@ button {
   background: var(--teal-50);
   color: var(--teal-700);
 }
+.badge-processing,
+.badge-in_progress {
+  background: var(--teal-50);
+  color: var(--teal-700);
+}
+.badge-urgent {
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-weight: 600;
+}
 .badge-resolved,
+.badge-closed,
 .badge-pass,
 .badge-success {
   background: var(--success-bg);

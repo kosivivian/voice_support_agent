@@ -23,7 +23,7 @@ export default async function AdminLayout({ children }: { children: React.ReactN
     <div className={styles.shell}>
       <aside className={styles.sidebar}>
         <div style={{ padding: "0 6px" }}>
-          <Logo subtitle="Admin" />
+          <Logo subtitle="Admin" stacked />
         </div>
         <AdminNav />
         <div className={styles.sidebarFooter}>

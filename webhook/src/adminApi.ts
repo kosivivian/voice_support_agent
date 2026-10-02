@@ -135,10 +135,38 @@ adminRouter.get(
 // ---------------------------------------------------------------------------
 // Tickets, escalations, retrieval logs
 // ---------------------------------------------------------------------------
+// Escalated tickets are urgent: they come first, newest first within each group.
 adminRouter.get(
   "/tickets",
   wrap(async (req, res) => {
-    res.json(must(await adminDb.from("tickets").select("*").order("created_at", { ascending: false }).limit(limitOf(req))));
+    const rows = must(
+      await adminDb
+        .from("tickets")
+        .select("*, escalations(escalation_id, category, status, preferred_time)")
+        .order("created_at", { ascending: false })
+        .limit(limitOf(req)),
+    ) as ({ escalations: unknown[] | null } & Record<string, unknown>)[];
+    const withFlags = rows.map((t) => ({ ...t, urgent: (t.escalations?.length ?? 0) > 0 }));
+    withFlags.sort((a, b) => Number(b.urgent) - Number(a.urgent));
+    res.json(withFlags);
+  }),
+);
+
+const TICKET_TO_ESCALATION_STATUS = { open: "open", processing: "in_progress", resolved: "closed" } as const;
+
+adminRouter.patch(
+  "/tickets/:id",
+  wrap(async (req, res) => {
+    const parsed = z.object({ status: z.enum(["open", "processing", "resolved"]) }).safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "status must be open, processing or resolved" });
+      return;
+    }
+    const { status } = parsed.data;
+    const ticket = must(await adminDb.from("tickets").update({ status }).eq("ticket_id", req.params.id).select("*").single());
+    // Keep the linked escalation in step so both views agree.
+    must(await adminDb.from("escalations").update({ status: TICKET_TO_ESCALATION_STATUS[status] }).eq("ticket_id", req.params.id).select("escalation_id"));
+    res.json(ticket);
   }),
 );
 
