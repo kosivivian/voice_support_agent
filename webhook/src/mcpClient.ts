@@ -78,6 +78,12 @@ async function rpc<T>(method: string, params: unknown, headers: Record<string, s
 }
 
 let toolsPromise: Promise<{ tools: McpToolDef[]; instructions?: string }> | null = null;
+let lastStatus = "not checked yet";
+
+/** Whether the MCP server was reachable the last time the tools were fetched. */
+export function mcpStatus(): string {
+  return lastStatus;
+}
 
 /** Tool definitions and server instructions, fetched once per process (retried after a failure). */
 export function getMcpTools(): Promise<{ tools: McpToolDef[]; instructions?: string }> {
@@ -89,9 +95,12 @@ export function getMcpTools(): Promise<{ tools: McpToolDef[]; instructions?: str
     });
     const { tools } = await rpc<{ tools: McpToolDef[] }>("tools/list", {});
     console.log(`[mcp] cached ${tools.length} tool definitions from ${base.origin}`);
+    lastStatus = `ok (${tools.length} tools)`;
     return { tools, instructions: init.instructions };
   })().catch((err) => {
     toolsPromise = null;
+    lastStatus = `unreachable at ${base.origin}: ${err instanceof Error ? err.message : String(err)}`;
+    console.error(`[mcp] ${lastStatus}`);
     throw err;
   });
   return toolsPromise;

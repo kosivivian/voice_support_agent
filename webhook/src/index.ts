@@ -3,7 +3,7 @@ import cors from "cors";
 import express from "express";
 import { adminRouter } from "./adminApi.js";
 import { startAgentPool } from "./agentPool.js";
-import { getMcpTools, keepMcpConnectionWarm } from "./mcpClient.js";
+import { getMcpTools, keepMcpConnectionWarm, mcpStatus } from "./mcpClient.js";
 import { config } from "./config.js";
 import { publicRouter } from "./publicApi.js";
 import { vapiRouter } from "./vapi.js";
@@ -25,7 +25,7 @@ if (config.isProduction) {
 app.use(express.json({ limit: "2mb" }));
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "relaypay-webhook", model: config.agentModel, commit: process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 7) ?? "local", streaming: true });
+  res.json({ ok: true, service: "relaypay-webhook", model: config.agentModel, commit: process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 7) ?? "local", mcp: mcpStatus() });
 });
 
 app.use("/vapi", vapiRouter);
