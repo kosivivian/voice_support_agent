@@ -20,7 +20,7 @@ Every lookup result includes `agent_guidance` (what the agent may say and when t
 
 ## Option A: test the deployed server (no setup)
 
-- URL: `https://YOUR-MCP-SERVICE.up.railway.app/mcp`
+- URL: `https://voicesupportagent-production.up.railway.app/mcp`
 - API key: provided separately with the submission
 
 **With MCP Inspector (UI):**
@@ -34,7 +34,7 @@ Choose transport **Streamable HTTP**, paste the URL, and add the header `x-api-k
 **With curl:**
 
 ```bash
-URL=https://YOUR-MCP-SERVICE.up.railway.app/mcp
+URL=https://voicesupportagent-production.up.railway.app/mcp
 KEY=the-api-key
 
 # List the tools
