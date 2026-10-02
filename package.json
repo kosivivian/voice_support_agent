@@ -1,6 +1,9 @@
 {
   "name": "relaypay-support",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "workspaces": ["mcp-server", "webhook", "web", "scripts"],
   "scripts": {
     "dev:mcp": "npm run dev -w mcp-server",

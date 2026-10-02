@@ -106,6 +106,21 @@ function instrument<A>(ctx: CallContext, toolName: string, fn: (args: A) => Prom
   };
 }
 
+const UNKNOWN_CUSTOMER = {
+  found: false,
+  error: "unknown_customer",
+  message: "That customer is not recognised. Call lookup_customer with the caller's confirmed email, or pass that email here as customer_id.",
+};
+
+/** The customer_id for a customer_id or a (verified) email address, or null if there is no such customer. */
+async function resolveCustomerId(idOrEmail: string): Promise<string | null> {
+  const value = idOrEmail.trim();
+  const { data } = value.includes("@")
+    ? await db.from("customers").select("customer_id").eq("contact_email", value.toLowerCase()).maybeSingle()
+    : await db.from("customers").select("customer_id").eq("customer_id", value.toUpperCase()).maybeSingle();
+  return data?.customer_id ?? null;
+}
+
 async function customerExists(customerId: string | undefined | null): Promise<string | null> {
   if (!customerId) return null;
   const { data } = await db.from("customers").select("customer_id").eq("customer_id", customerId).maybeSingle();
@@ -182,7 +197,7 @@ export function buildServer(ctx: CallContext): McpServer {
       description:
         "Look up a transaction for a VERIFIED customer. Requires the customer_id returned by lookup_customer. transaction_reference is the reference the caller gives (e.g. TXN-9001); omit it to list the customer's recent transactions. Each result includes is_stale and agent_guidance — follow agent_guidance exactly. Never read reference numbers aloud; push them to the chat window instead.",
       inputSchema: z.object({
-        customer_id: z.string().describe("customer_id from lookup_customer"),
+        customer_id: z.string().describe("customer_id from lookup_customer, or the caller's confirmed email address"),
         transaction_reference: z.string().optional().describe("Transaction reference, e.g. TXN-9001"),
       }),
     },
@@ -190,10 +205,12 @@ export function buildServer(ctx: CallContext): McpServer {
       ctx,
       "lookup_transaction",
       async ({ customer_id, transaction_reference }: { customer_id: string; transaction_reference?: string }) => {
+        const customerId = customer_id.includes("@") ? await resolveCustomerId(customer_id) : customer_id.trim().toUpperCase();
+        if (!customerId) return UNKNOWN_CUSTOMER;
         let query = db
           .from("transactions")
           .select("transaction_id, transaction_type, amount, currency, destination_country, status, created_at, estimated_arrival, support_summary")
-          .eq("customer_id", customer_id)
+          .eq("customer_id", customerId)
           .order("created_at", { ascending: false })
           .limit(5);
         if (transaction_reference) {
@@ -202,6 +219,7 @@ export function buildServer(ctx: CallContext): McpServer {
         const { data, error } = await query;
         if (error) throw new Error(error.message);
         if (!data || data.length === 0) {
+          if (!(await resolveCustomerId(customerId))) return UNKNOWN_CUSTOMER;
           return {
             found: false,
             message: transaction_reference
@@ -238,15 +256,17 @@ export function buildServer(ctx: CallContext): McpServer {
       description:
         "Look up a contractor/vendor payout for a VERIFIED customer. Requires the customer_id returned by lookup_customer. payout_reference is the reference the caller gives (e.g. PAY-7001); omit it to list the customer's recent payouts. The same stale-data rule as transactions applies — follow agent_guidance exactly.",
       inputSchema: z.object({
-        customer_id: z.string().describe("customer_id from lookup_customer"),
+        customer_id: z.string().describe("customer_id from lookup_customer, or the caller's confirmed email address"),
         payout_reference: z.string().optional().describe("Payout reference, e.g. PAY-7001"),
       }),
     },
     instrument(ctx, "lookup_payout", async ({ customer_id, payout_reference }: { customer_id: string; payout_reference?: string }) => {
+      const customerId = customer_id.includes("@") ? await resolveCustomerId(customer_id) : customer_id.trim().toUpperCase();
+      if (!customerId) return UNKNOWN_CUSTOMER;
       let query = db
         .from("payouts")
         .select("payout_id, transaction_id, recipient_name, amount, currency, status, scheduled_for, failure_reason, created_at, transactions(destination_country)")
-        .eq("customer_id", customer_id)
+        .eq("customer_id", customerId)
         .order("scheduled_for", { ascending: false })
         .limit(5);
       if (payout_reference) {
@@ -255,6 +275,7 @@ export function buildServer(ctx: CallContext): McpServer {
       const { data, error } = await query;
       if (error) throw new Error(error.message);
       if (!data || data.length === 0) {
+        if (!(await resolveCustomerId(customerId))) return UNKNOWN_CUSTOMER;
         return {
           found: false,
           message: payout_reference

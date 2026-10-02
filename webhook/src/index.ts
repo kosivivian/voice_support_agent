@@ -1,3 +1,4 @@
+import "./reportFix.js";
 import "./keepalive.js";
 import cors from "cors";
 import express from "express";
