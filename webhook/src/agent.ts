@@ -1,6 +1,7 @@
 import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
 import * as z from "zod";
 import { publish } from "./chatHub.js";
+import { rememberLookup } from "./callMemory.js";
 import { config } from "./config.js";
 import { logToolCall } from "./logging.js";
 import { JANE_SYSTEM_PROMPT } from "./prompt.js";
@@ -14,6 +15,8 @@ const RELAYPAY_TOOLS = [
   "create_escalation",
   "log_conversation_event",
 ].map((name) => `mcp__relaypay__${name}`);
+
+const REMEMBERED_TOOLS = new Set(["lookup_customer", "lookup_transaction", "lookup_payout"]);
 
 export interface TurnIdentity {
   vapiCallId: string;
@@ -99,6 +102,7 @@ export async function runJaneTurn(
   let hadToolError = false;
   let hadConfidentRetrieval: boolean | null = null;
   const pendingToolNames = new Map<string, string>();
+  const pendingToolInputs = new Map<string, unknown>();
   let streamed = "";
 
   const stream = query({
@@ -160,6 +164,7 @@ export async function runJaneTurn(
           const name = block.name.replace(/^mcp__(relaypay|chat)__/, "");
           toolsUsed.push(name);
           pendingToolNames.set(block.id, name);
+          pendingToolInputs.set(block.id, block.input);
         }
       }
     } else if (message.type === "user" && Array.isArray(message.message.content)) {
@@ -168,6 +173,9 @@ export async function runJaneTurn(
         const name = pendingToolNames.get(block.tool_use_id);
         const text = toolResultText(block.content);
         if (block.is_error || text.includes('"error":"technical_error"')) hadToolError = true;
+        if (name && REMEMBERED_TOOLS.has(name) && !block.is_error && text.includes('"found":true')) {
+          rememberLookup(turn.vapiCallId, name, pendingToolInputs.get(block.tool_use_id), text);
+        }
         if (name === "retrieve_knowledge") {
           const confident = text.includes('"has_confident_match":true');
           hadConfidentRetrieval = (hadConfidentRetrieval ?? false) || confident;

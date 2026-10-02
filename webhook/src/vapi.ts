@@ -3,6 +3,7 @@ import { timingSafeEqual } from "node:crypto";
 import { AgentFailure, classifyAnswer, runJaneTurn } from "./agent.js";
 import { CLOSING_LINE, FALLBACK_LINE, GREETING, config } from "./config.js";
 import { notifySupport } from "./email.js";
+import { earlierLookups } from "./callMemory.js";
 import { conversationIdForCall } from "./ids.js";
 import { finalizeConversation, logTurn, markConversationError, recordTurnCount, startConversation } from "./logging.js";
 import { buildTurnPrompt, type TranscriptMessage } from "./prompt.js";
@@ -189,7 +190,7 @@ vapiRouter.post("/chat/completions", async (req, res) => {
   });
 
   try {
-    const prompt = buildTurnPrompt({ transcript, turnNumber, elapsedSeconds, wrapUp });
+    const prompt = buildTurnPrompt({ transcript, turnNumber, elapsedSeconds, wrapUp, earlierLookups: earlierLookups(vapiCallId) });
     const result = await runJaneTurn(prompt, { vapiCallId, conversationId, turnId: userTurnId, turnNumber }, abort, {
       onText: (delta) => {
         toolRunning = false;

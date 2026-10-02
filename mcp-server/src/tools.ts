@@ -38,17 +38,17 @@ function isStale(status: string, estimatedArrival: string | null): boolean {
 }
 
 function guidanceFor(status: string, stale: boolean): string {
-  if (stale) {
-    return "STALE: the estimated arrival date has passed and the record is still unresolved. Do NOT read the status or dates aloud. Create a ticket, then an escalation with category stale_data, and tell the customer a specialist will follow up.";
-  }
   const s = status.toLowerCase();
   if (s === "review required") {
-    return "Under compliance review. Do not explain or speculate about the review. Create a ticket, then an escalation with category compliance.";
+    return "UNDER REVIEW: tell the caller it is currently under review by our team. Do not explain, speculate about, or give a timeline for the review. Then ask whether they would like a specialist to follow up; only if they say yes, create a ticket and then an escalation with category compliance.";
   }
   if (s === "failed") {
-    return "Failed. You may share the customer-safe summary and offer to create a support ticket so the team can look into it.";
+    return "FAILED: tell the caller it failed and give the customer-safe reason (support_summary or failure_reason) in your own words. Then ask whether they would like a support ticket so the team can help sort it out; only if they say yes, create a ticket.";
   }
-  return "You may share the status and the customer-safe summary. Do not promise an exact arrival time.";
+  if (stale) {
+    return "OVERDUE: tell the caller the current status and that the estimated arrival date on record has passed, so it is taking longer than expected. Do not repeat support_summary wording that says it is within a normal window. Then ask whether they would like a specialist to look into it; only if they say yes, create a ticket and then an escalation with category stale_data.";
+  }
+  return "ON TRACK: tell the caller the status and the support_summary in your own words. If they ask when it will arrive, give the estimated_arrival date on record and do not promise anything beyond it. Do not offer a ticket or escalation unless the caller asks for one.";
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
