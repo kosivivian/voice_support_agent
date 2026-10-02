@@ -425,7 +425,7 @@ export function buildServer(ctx: CallContext): McpServer {
         reason: z
           .string()
           .describe("Why this is escalated. Note here if the caller appears to be outside WAT (UTC+1) based on the time they gave."),
-        preferred_time: z.string().optional().describe('Callback time exactly as the caller said it, e.g. "tomorrow at 9am"'),
+        preferred_time: z.string().describe('Callback time exactly as the caller said it, e.g. "tomorrow at 9am"'),
       }),
     },
     instrument(
