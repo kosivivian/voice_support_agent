@@ -40,7 +40,8 @@ export const config = {
   // Comma-separated origins allowed to call the public /api routes (the Next.js site).
   webOrigins: (process.env.WEB_ORIGIN ?? "http://localhost:3000")
     .split(",")
-    .map((s) => s.trim())
+    // Browsers send the origin without a trailing slash, so a pasted URL ending in "/" would never match.
+    .map((s) => s.trim().replace(/\/+$/, ""))
     .filter(Boolean),
 
   maxTurns: 10,
