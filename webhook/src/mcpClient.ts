@@ -25,8 +25,9 @@ export interface McpToolResult {
   isError?: boolean;
 }
 
-const base = new URL(config.mcpServerUrl.replace(/\/+$/, ""));
-const isHttps = base.protocol === "https:";
+const base = new URL(config.mcpServerUrl.replace(/\/+$/, "").replace(/\/mcp$/, ""));
+// Railway's private network is plain HTTP; https:// there fails with "wrong version number".
+const isHttps = base.protocol === "https:" && !base.hostname.endsWith(".railway.internal");
 const agent = isHttps
   ? new https.Agent({ keepAlive: true, keepAliveMsecs: 15_000, maxSockets: 32 })
   : new http.Agent({ keepAlive: true, keepAliveMsecs: 15_000, maxSockets: 32 });
