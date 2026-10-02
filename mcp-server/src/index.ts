@@ -36,12 +36,14 @@ app.set("trust proxy", true);
 app.disable("x-powered-by");
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "relaypay-mcp" });
+  res.json({ ok: true, service: "relaypay-mcp", commit: process.env.RAILWAY_GIT_COMMIT_SHA?.slice(0, 7) ?? "local" });
 });
 
 app.use("/mcp", (req, res, next) => {
-  // Railway's private network (*.railway.internal) is plain HTTP inside the project, so it is allowed too.
-  if (config.enforceHttps && req.protocol !== "https" && !req.hostname.endsWith(".railway.internal")) {
+  // Public traffic always arrives through Railway's edge, which sets x-forwarded-proto; reject it unless it was HTTPS.
+  // Private-network traffic (*.railway.internal) never passes the edge, has no such header, and is allowed.
+  const forwardedProto = req.header("x-forwarded-proto");
+  if (config.enforceHttps && forwardedProto && forwardedProto.split(",")[0].trim() !== "https") {
     res.status(403).json({ error: "HTTPS required" });
     return;
   }
